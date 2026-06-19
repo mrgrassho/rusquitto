@@ -307,7 +307,7 @@ fn decode_publish(
     }
     let topic = cursor.read_utf8()?;
     let packet_id = if qos > 0 {
-        Some(cursor.read_u16()?)
+        Some(read_packet_id(cursor)?)
     } else {
         None
     };
@@ -395,7 +395,13 @@ fn decode_disconnect(
 }
 
 fn read_packet_id(cursor: &mut Cursor<'_>) -> Result<u16, ProtocolError> {
-    cursor.read_u16()
+    let packet_id = cursor.read_u16()?;
+    if packet_id == 0 {
+        return Err(ProtocolError::MalformedPacket(
+            "packet identifier must be non-zero",
+        ));
+    }
+    Ok(packet_id)
 }
 
 pub fn encode_frame(command: u8, flags: u8, body: &[u8]) -> Vec<u8> {
@@ -442,7 +448,12 @@ pub fn encode_publish(protocol: ProtocolVersion, publication: &Publication) -> V
     let mut body = Vec::new();
     write_utf8(&publication.topic, &mut body);
     if publication.qos > 0 {
-        write_u16(publication.packet_id.unwrap_or(1), &mut body);
+        write_u16(
+            publication
+                .packet_id
+                .expect("QoS publish requires a packet identifier"),
+            &mut body,
+        );
     }
     if protocol == ProtocolVersion::V5 {
         body.push(0);
@@ -779,6 +790,67 @@ mod tests {
             }
             other => panic!("unexpected packet: {other:?}"),
         }
+    }
+
+    #[test]
+    fn decodes_qos1_publish_packet_identifier() {
+        let packet = decode_frame(
+            &Frame {
+                command: CMD_PUBLISH,
+                flags: 0x02,
+                body: vec![0, 1, b'a', 0x12, 0x34, b'p'],
+            },
+            Some(ProtocolVersion::V311),
+        )
+        .unwrap();
+        match packet {
+            MqttPacket::Publish(publication) => {
+                assert_eq!(publication.qos, 1);
+                assert_eq!(publication.packet_id, Some(0x1234));
+                assert_eq!(publication.payload, b"p");
+            }
+            other => panic!("unexpected packet: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_zero_packet_identifier() {
+        let publish = decode_frame(
+            &Frame {
+                command: CMD_PUBLISH,
+                flags: 0x02,
+                body: vec![0, 1, b'a', 0, 0],
+            },
+            Some(ProtocolVersion::V311),
+        );
+        assert!(matches!(publish, Err(ProtocolError::MalformedPacket(_))));
+
+        let puback = decode_frame(
+            &Frame {
+                command: CMD_PUBACK,
+                flags: 0,
+                body: vec![0, 0],
+            },
+            Some(ProtocolVersion::V311),
+        );
+        assert!(matches!(puback, Err(ProtocolError::MalformedPacket(_))));
+    }
+
+    #[test]
+    fn encodes_qos1_publish_packet_identifier() {
+        let encoded = encode_publish(
+            ProtocolVersion::V311,
+            &Publication {
+                topic: "a".into(),
+                payload: b"p".to_vec(),
+                qos: 1,
+                retain: false,
+                packet_id: Some(0x1234),
+                dup: true,
+                topic_alias: None,
+            },
+        );
+        assert_eq!(encoded, vec![0x3A, 6, 0, 1, b'a', 0x12, 0x34, b'p']);
     }
 
     #[test]
