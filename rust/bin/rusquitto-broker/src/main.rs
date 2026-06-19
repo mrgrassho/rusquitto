@@ -15,6 +15,7 @@ use rusquitto_protocol::{
 };
 
 const MQTT_RC_MALFORMED_PACKET: u8 = 0x81;
+const MQTT_RC_PROTOCOL_ERROR: u8 = 0x82;
 const MQTT_RC_NOT_AUTHORIZED: u8 = 0x87;
 
 type OutboundMap = Arc<Mutex<HashMap<String, Sender<Vec<u8>>>>>;
@@ -299,6 +300,24 @@ fn handle_client(
             MqttPacket::PubRel { packet_id } => {
                 let _ = tx.send(encode_pubcomp(protocol, packet_id));
             }
+            MqttPacket::PubAck { packet_id } => {
+                broker
+                    .lock()
+                    .expect("broker lock poisoned")
+                    .puback(&client_id, packet_id);
+            }
+            MqttPacket::PubRec { packet_id } | MqttPacket::PubComp { packet_id } => {
+                let invalid_qos1_ack = broker
+                    .lock()
+                    .expect("broker lock poisoned")
+                    .has_inflight_qos1(&client_id, packet_id);
+                if invalid_qos1_ack {
+                    if protocol == ProtocolVersion::V5 {
+                        let _ = tx.send(encode_disconnect(protocol, MQTT_RC_PROTOCOL_ERROR));
+                    }
+                    break;
+                }
+            }
             MqttPacket::Subscribe { packet_id, filters } => {
                 let result = broker
                     .lock()
@@ -333,7 +352,6 @@ fn handle_client(
                     .remove(&client_id);
                 return Ok(());
             }
-            MqttPacket::PubAck { .. } | MqttPacket::PubRec { .. } | MqttPacket::PubComp { .. } => {}
             MqttPacket::Connect { .. } => break,
         }
     }
