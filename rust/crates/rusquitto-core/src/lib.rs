@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use rusquitto_protocol::topic;
 use rusquitto_protocol::{Publication, SubscriptionRequest, Will};
@@ -17,6 +18,9 @@ pub struct ClientSession {
     pub client_id: String,
     pub subscriptions: HashMap<String, Subscription>,
     pub will: Option<Will>,
+    pub queued: Vec<Publication>,
+    pub session_expiry_interval: u32,
+    pub disconnected_at: Option<Instant>,
     pub online: bool,
 }
 
@@ -46,7 +50,9 @@ impl BrokerState {
         client_id: String,
         clean_start: bool,
         will: Option<Will>,
+        session_expiry_interval: u32,
     ) -> ConnectResult {
+        self.expire_sessions_at(Instant::now());
         let session_present = !clean_start && self.clients.contains_key(&client_id);
         if clean_start || !self.clients.contains_key(&client_id) {
             self.clients.insert(
@@ -55,19 +61,45 @@ impl BrokerState {
                     client_id: client_id.clone(),
                     subscriptions: HashMap::new(),
                     will,
+                    queued: Vec::new(),
+                    session_expiry_interval,
+                    disconnected_at: None,
                     online: true,
                 },
             );
         } else if let Some(session) = self.clients.get_mut(&client_id) {
             session.will = will;
+            session.session_expiry_interval = session_expiry_interval;
+            session.disconnected_at = None;
             session.online = true;
         }
-        ConnectResult { session_present }
+
+        let queued = self
+            .clients
+            .get_mut(&client_id)
+            .map(|session| std::mem::take(&mut session.queued))
+            .unwrap_or_default();
+
+        ConnectResult {
+            session_present,
+            queued,
+        }
     }
 
-    pub fn disconnect(&mut self, client_id: &str, graceful: bool) -> Vec<Delivery> {
+    pub fn disconnect(
+        &mut self,
+        client_id: &str,
+        graceful: bool,
+        session_expiry_interval: Option<u32>,
+    ) -> Vec<Delivery> {
+        let mut remove_session = false;
         let will = self.clients.get_mut(client_id).and_then(|session| {
             session.online = false;
+            if let Some(session_expiry_interval) = session_expiry_interval {
+                session.session_expiry_interval = session_expiry_interval;
+            }
+            session.disconnected_at = Some(Instant::now());
+            remove_session = session.session_expiry_interval == 0;
             if graceful {
                 session.will = None;
                 None
@@ -86,8 +118,15 @@ impl BrokerState {
                 dup: false,
                 topic_alias: None,
             };
-            self.publish(client_id, publication).deliveries
+            let deliveries = self.publish(client_id, publication).deliveries;
+            if remove_session {
+                self.clients.remove(client_id);
+            }
+            deliveries
         } else {
+            if remove_session {
+                self.clients.remove(client_id);
+            }
             Vec::new()
         }
     }
@@ -204,9 +243,6 @@ impl BrokerState {
         let mut deliveries = Vec::new();
         let mut delivery_specs = Vec::new();
         for (client_id, session) in &self.clients {
-            if !session.online {
-                continue;
-            }
             for subscription in session.subscriptions.values() {
                 if subscription.no_local && client_id == source_client_id {
                     continue;
@@ -216,27 +252,50 @@ impl BrokerState {
                         client_id.clone(),
                         subscription.qos.min(publication.qos),
                         subscription.retain_as_published,
+                        session.online,
                     ));
                     break;
                 }
             }
         }
 
-        for (client_id, qos, retain_as_published) in delivery_specs {
+        for (client_id, qos, retain_as_published, online) in delivery_specs {
             publication.qos = qos;
             let mut outgoing = publication.clone();
             outgoing.retain = retain_as_published && outgoing.retain;
             outgoing.packet_id = (outgoing.qos > 0).then(|| self.next_packet_id());
-            deliveries.push(Delivery {
-                client_id,
-                publication: outgoing,
-            });
+            if online {
+                deliveries.push(Delivery {
+                    client_id,
+                    publication: outgoing,
+                });
+            } else if outgoing.qos > 0 {
+                if let Some(session) = self.clients.get_mut(&client_id) {
+                    session.queued.push(outgoing);
+                }
+            }
         }
 
         PublishResult {
             accepted: true,
             deliveries,
         }
+    }
+
+    fn expire_sessions_at(&mut self, now: Instant) {
+        self.clients.retain(|_, session| {
+            if session.online {
+                return true;
+            }
+            if session.session_expiry_interval == u32::MAX {
+                return true;
+            }
+            let Some(disconnected_at) = session.disconnected_at else {
+                return true;
+            };
+            now.duration_since(disconnected_at)
+                < Duration::from_secs(u64::from(session.session_expiry_interval))
+        });
     }
 
     fn next_packet_id(&mut self) -> u16 {
@@ -250,9 +309,10 @@ impl BrokerState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectResult {
     pub session_present: bool,
+    pub queued: Vec<Publication>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -286,7 +346,7 @@ mod tests {
     #[test]
     fn routes_matching_subscriptions() {
         let mut broker = BrokerState::new();
-        broker.connect("sub".into(), true, None);
+        broker.connect("sub".into(), true, None, 0);
         broker.subscribe(
             "sub",
             vec![SubscriptionRequest {
@@ -306,9 +366,9 @@ mod tests {
     #[test]
     fn retains_and_replays_messages() {
         let mut broker = BrokerState::new();
-        broker.connect("pub".into(), true, None);
+        broker.connect("pub".into(), true, None, 0);
         broker.publish("pub", publication("retain/topic", true));
-        broker.connect("sub".into(), true, None);
+        broker.connect("sub".into(), true, None, 0);
         let result = broker.subscribe(
             "sub",
             vec![SubscriptionRequest {
@@ -327,7 +387,7 @@ mod tests {
     #[test]
     fn publishes_will_on_ungraceful_disconnect() {
         let mut broker = BrokerState::new();
-        broker.connect("sub".into(), true, None);
+        broker.connect("sub".into(), true, None, 0);
         broker.subscribe(
             "sub",
             vec![SubscriptionRequest {
@@ -347,9 +407,73 @@ mod tests {
                 qos: 0,
                 retain: false,
             }),
+            0,
         );
-        let deliveries = broker.disconnect("will", false);
+        let deliveries = broker.disconnect("will", false, None);
         assert_eq!(deliveries.len(), 1);
         assert_eq!(deliveries[0].publication.payload, b"gone");
+    }
+
+    #[test]
+    fn queues_qos_messages_for_offline_durable_sessions() {
+        let mut broker = BrokerState::new();
+        broker.connect("sub".into(), false, None, 60);
+        broker.subscribe(
+            "sub",
+            vec![SubscriptionRequest {
+                filter: "offline/qos1".into(),
+                qos: 1,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+            }],
+        );
+        broker.disconnect("sub", true, None);
+
+        let mut queued = publication("offline/qos1", false);
+        queued.qos = 1;
+        queued.packet_id = Some(10);
+        let publish_result = broker.publish("pub", queued);
+        assert!(publish_result.accepted);
+        assert!(publish_result.deliveries.is_empty());
+
+        let reconnect = broker.connect("sub".into(), false, None, 60);
+        assert!(reconnect.session_present);
+        assert_eq!(reconnect.queued.len(), 1);
+        assert_eq!(reconnect.queued[0].topic, "offline/qos1");
+        assert_eq!(reconnect.queued[0].qos, 1);
+        assert_eq!(reconnect.queued[0].packet_id, Some(1));
+    }
+
+    #[test]
+    fn expires_offline_sessions() {
+        let mut broker = BrokerState::new();
+        broker.connect("sub".into(), false, None, 1);
+        broker.subscribe(
+            "sub",
+            vec![SubscriptionRequest {
+                filter: "expire/me".into(),
+                qos: 1,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+            }],
+        );
+        broker.disconnect("sub", true, None);
+        let disconnected_at = broker.clients["sub"].disconnected_at.unwrap();
+        broker.expire_sessions_at(disconnected_at + Duration::from_secs(2));
+
+        let reconnect = broker.connect("sub".into(), false, None, 1);
+        assert!(!reconnect.session_present);
+        assert!(reconnect.queued.is_empty());
+    }
+
+    #[test]
+    fn disconnect_can_clear_session_with_expiry_zero() {
+        let mut broker = BrokerState::new();
+        broker.connect("sub".into(), false, None, 60);
+        broker.disconnect("sub", true, Some(0));
+        let reconnect = broker.connect("sub".into(), false, None, 60);
+        assert!(!reconnect.session_present);
     }
 }

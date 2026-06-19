@@ -115,6 +115,7 @@ pub enum MqttPacket {
         username: Option<String>,
         password: Option<Vec<u8>>,
         will: Option<Will>,
+        session_expiry_interval: Option<u32>,
     },
     Publish(Publication),
     PubAck {
@@ -140,6 +141,7 @@ pub enum MqttPacket {
     PingReq,
     Disconnect {
         reason_code: Option<u8>,
+        session_expiry_interval: Option<u32>,
     },
 }
 
@@ -249,9 +251,11 @@ fn decode_connect(cursor: &mut Cursor<'_>) -> Result<MqttPacket, ProtocolError> 
     let username_flag = (flags & 0x80) != 0;
     let keep_alive = cursor.read_u16()?;
 
-    if protocol == ProtocolVersion::V5 {
-        cursor.skip_properties()?;
-    }
+    let session_expiry_interval = if protocol == ProtocolVersion::V5 {
+        cursor.read_session_expiry_property()?
+    } else {
+        None
+    };
 
     let client_id = cursor.read_utf8()?;
     let will = if will_flag {
@@ -286,6 +290,7 @@ fn decode_connect(cursor: &mut Cursor<'_>) -> Result<MqttPacket, ProtocolError> 
         username,
         password,
         will,
+        session_expiry_interval,
     })
 }
 
@@ -372,14 +377,20 @@ fn decode_disconnect(
     current_protocol: Option<ProtocolVersion>,
 ) -> Result<MqttPacket, ProtocolError> {
     if cursor.remaining() == 0 || current_protocol != Some(ProtocolVersion::V5) {
-        return Ok(MqttPacket::Disconnect { reason_code: None });
+        return Ok(MqttPacket::Disconnect {
+            reason_code: None,
+            session_expiry_interval: None,
+        });
     }
     let reason_code = cursor.read_u8()?;
-    if cursor.remaining() > 0 {
-        cursor.skip_properties()?;
-    }
+    let session_expiry_interval = if cursor.remaining() > 0 {
+        cursor.read_session_expiry_property()?
+    } else {
+        None
+    };
     Ok(MqttPacket::Disconnect {
         reason_code: Some(reason_code),
+        session_expiry_interval,
     })
 }
 
@@ -535,6 +546,11 @@ impl<'a> Cursor<'a> {
         Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
     }
 
+    fn read_u32(&mut self) -> Result<u32, ProtocolError> {
+        let bytes = self.read_bytes(4)?;
+        Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
     fn read_utf8(&mut self) -> Result<String, ProtocolError> {
         let len = self.read_u16()? as usize;
         let bytes = self.read_bytes(len)?;
@@ -579,6 +595,27 @@ impl<'a> Cursor<'a> {
         Ok(())
     }
 
+    fn read_session_expiry_property(&mut self) -> Result<Option<u32>, ProtocolError> {
+        let len = self.read_varint()? as usize;
+        if self.remaining() < len {
+            return Err(ProtocolError::MalformedPacket("truncated properties"));
+        }
+        let end = self.pos + len;
+        let mut session_expiry_interval = None;
+        while self.pos < end {
+            let identifier = self.read_varint()?;
+            if identifier == PROP_SESSION_EXPIRY_INTERVAL {
+                session_expiry_interval = Some(self.read_u32()?);
+            } else {
+                self.skip_property_value(identifier)?;
+            }
+        }
+        if self.pos != end {
+            return Err(ProtocolError::MalformedPacket("property length mismatch"));
+        }
+        Ok(session_expiry_interval)
+    }
+
     fn read_publish_properties(&mut self) -> Result<Option<u16>, ProtocolError> {
         let len = self.read_varint()? as usize;
         if self.remaining() < len {
@@ -589,58 +626,68 @@ impl<'a> Cursor<'a> {
         while self.pos < end {
             let identifier = self.read_varint()?;
             match identifier {
-                PROP_PAYLOAD_FORMAT_INDICATOR
-                | PROP_REQUEST_PROBLEM_INFORMATION
-                | PROP_REQUEST_RESPONSE_INFORMATION
-                | PROP_MAXIMUM_QOS
-                | PROP_RETAIN_AVAILABLE
-                | PROP_WILDCARD_SUB_AVAILABLE
-                | PROP_SUBSCRIPTION_ID_AVAILABLE
-                | PROP_SHARED_SUB_AVAILABLE => {
-                    self.read_u8()?;
-                }
-                PROP_SERVER_KEEP_ALIVE | PROP_RECEIVE_MAXIMUM | PROP_TOPIC_ALIAS_MAXIMUM => {
-                    self.read_u16()?;
-                }
                 PROP_TOPIC_ALIAS => {
                     topic_alias = Some(self.read_u16()?);
                 }
-                PROP_MESSAGE_EXPIRY_INTERVAL
-                | PROP_SESSION_EXPIRY_INTERVAL
-                | PROP_WILL_DELAY_INTERVAL
-                | PROP_MAXIMUM_PACKET_SIZE => {
-                    self.read_bytes(4)?;
-                }
-                PROP_SUBSCRIPTION_IDENTIFIER => {
-                    self.read_varint()?;
-                }
-                PROP_CONTENT_TYPE
-                | PROP_RESPONSE_TOPIC
-                | PROP_ASSIGNED_CLIENT_IDENTIFIER
-                | PROP_AUTHENTICATION_METHOD
-                | PROP_RESPONSE_INFORMATION
-                | PROP_SERVER_REFERENCE
-                | PROP_REASON_STRING => {
-                    let skip = self.read_u16()? as usize;
-                    self.read_bytes(skip)?;
-                }
-                PROP_CORRELATION_DATA | PROP_AUTHENTICATION_DATA => {
-                    let skip = self.read_u16()? as usize;
-                    self.read_bytes(skip)?;
-                }
-                PROP_USER_PROPERTY => {
-                    let name_len = self.read_u16()? as usize;
-                    self.read_bytes(name_len)?;
-                    let value_len = self.read_u16()? as usize;
-                    self.read_bytes(value_len)?;
-                }
-                _ => return Err(ProtocolError::MalformedPacket("unknown property")),
+                _ => self.skip_property_value(identifier)?,
             }
         }
         if self.pos != end {
             return Err(ProtocolError::MalformedPacket("property length mismatch"));
         }
         Ok(topic_alias)
+    }
+
+    fn skip_property_value(&mut self, identifier: u32) -> Result<(), ProtocolError> {
+        match identifier {
+            PROP_PAYLOAD_FORMAT_INDICATOR
+            | PROP_REQUEST_PROBLEM_INFORMATION
+            | PROP_REQUEST_RESPONSE_INFORMATION
+            | PROP_MAXIMUM_QOS
+            | PROP_RETAIN_AVAILABLE
+            | PROP_WILDCARD_SUB_AVAILABLE
+            | PROP_SUBSCRIPTION_ID_AVAILABLE
+            | PROP_SHARED_SUB_AVAILABLE => {
+                self.read_u8()?;
+            }
+            PROP_SERVER_KEEP_ALIVE | PROP_RECEIVE_MAXIMUM | PROP_TOPIC_ALIAS_MAXIMUM => {
+                self.read_u16()?;
+            }
+            PROP_TOPIC_ALIAS => {
+                self.read_u16()?;
+            }
+            PROP_MESSAGE_EXPIRY_INTERVAL
+            | PROP_SESSION_EXPIRY_INTERVAL
+            | PROP_WILL_DELAY_INTERVAL
+            | PROP_MAXIMUM_PACKET_SIZE => {
+                self.read_u32()?;
+            }
+            PROP_SUBSCRIPTION_IDENTIFIER => {
+                self.read_varint()?;
+            }
+            PROP_CONTENT_TYPE
+            | PROP_RESPONSE_TOPIC
+            | PROP_ASSIGNED_CLIENT_IDENTIFIER
+            | PROP_AUTHENTICATION_METHOD
+            | PROP_RESPONSE_INFORMATION
+            | PROP_SERVER_REFERENCE
+            | PROP_REASON_STRING => {
+                let skip = self.read_u16()? as usize;
+                self.read_bytes(skip)?;
+            }
+            PROP_CORRELATION_DATA | PROP_AUTHENTICATION_DATA => {
+                let skip = self.read_u16()? as usize;
+                self.read_bytes(skip)?;
+            }
+            PROP_USER_PROPERTY => {
+                let name_len = self.read_u16()? as usize;
+                self.read_bytes(name_len)?;
+                let value_len = self.read_u16()? as usize;
+                self.read_bytes(value_len)?;
+            }
+            _ => return Err(ProtocolError::MalformedPacket("unknown property")),
+        }
+        Ok(())
     }
 }
 
@@ -676,11 +723,59 @@ mod tests {
                 protocol,
                 client_id,
                 clean_start,
+                session_expiry_interval,
                 ..
             } => {
                 assert_eq!(protocol, ProtocolVersion::V5);
                 assert_eq!(client_id, "client");
                 assert!(clean_start);
+                assert_eq!(session_expiry_interval, None);
+            }
+            other => panic!("unexpected packet: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_session_expiry_properties() {
+        let body = [
+            0, 4, b'M', b'Q', b'T', b'T', 5, 0, 0, 60, 5, 0x11, 0, 0, 0, 60, 0, 6, b'c', b'l',
+            b'i', b'e', b'n', b't',
+        ];
+        let packet = decode_frame(
+            &Frame {
+                command: CMD_CONNECT,
+                flags: 0,
+                body: body.to_vec(),
+            },
+            None,
+        )
+        .unwrap();
+        match packet {
+            MqttPacket::Connect {
+                session_expiry_interval,
+                ..
+            } => {
+                assert_eq!(session_expiry_interval, Some(60));
+            }
+            other => panic!("unexpected packet: {other:?}"),
+        }
+
+        let disconnect = decode_frame(
+            &Frame {
+                command: CMD_DISCONNECT,
+                flags: 0,
+                body: vec![0, 5, 0x11, 0, 0, 0, 3],
+            },
+            Some(ProtocolVersion::V5),
+        )
+        .unwrap();
+        match disconnect {
+            MqttPacket::Disconnect {
+                reason_code,
+                session_expiry_interval,
+            } => {
+                assert_eq!(reason_code, Some(0));
+                assert_eq!(session_expiry_interval, Some(3));
             }
             other => panic!("unexpected packet: {other:?}"),
         }

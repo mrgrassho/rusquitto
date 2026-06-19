@@ -166,6 +166,20 @@ fn parse_bool(value: Option<&str>) -> Option<bool> {
     }
 }
 
+fn broker_session_expiry_interval(
+    protocol: ProtocolVersion,
+    clean_start: bool,
+    session_expiry_interval: Option<u32>,
+) -> u32 {
+    if protocol == ProtocolVersion::V5 {
+        session_expiry_interval.unwrap_or(0)
+    } else if clean_start {
+        0
+    } else {
+        u32::MAX
+    }
+}
+
 fn handle_client(
     mut stream: TcpStream,
     broker: SharedBroker,
@@ -183,12 +197,20 @@ fn handle_client(
             client_id,
             username,
             will,
+            session_expiry_interval,
             ..
-        }) => (protocol, clean_start, client_id, username, will),
+        }) => (
+            protocol,
+            clean_start,
+            client_id,
+            username,
+            will,
+            session_expiry_interval,
+        ),
         _ => return Ok(()),
     };
 
-    let (protocol, clean_start, mut client_id, username, will) = connect;
+    let (protocol, clean_start, mut client_id, username, will, session_expiry_interval) = connect;
     if client_id.is_empty() {
         client_id = format!("auto-{}", unique_id());
     }
@@ -202,12 +224,15 @@ fn handle_client(
         return Ok(());
     }
 
-    let session_present = broker
-        .lock()
-        .expect("broker lock poisoned")
-        .connect(client_id.clone(), clean_start, will)
-        .session_present;
-    stream.write_all(&encode_connack(protocol, session_present, 0))?;
+    let broker_session_expiry_interval =
+        broker_session_expiry_interval(protocol, clean_start, session_expiry_interval);
+    let connect_result = broker.lock().expect("broker lock poisoned").connect(
+        client_id.clone(),
+        clean_start,
+        will,
+        broker_session_expiry_interval,
+    );
+    stream.write_all(&encode_connack(protocol, connect_result.session_present, 0))?;
 
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     outbound
@@ -224,8 +249,11 @@ fn handle_client(
         }
     });
 
+    for publication in connect_result.queued {
+        let _ = tx.send(encode_publish(protocol, &publication));
+    }
+
     let mut topic_aliases: HashMap<u16, String> = HashMap::new();
-    let mut graceful = false;
     while let Ok(frame) = read_frame(&mut stream) {
         let packet = match decode_frame(&frame, Some(protocol)) {
             Ok(packet) => packet,
@@ -289,9 +317,21 @@ fn handle_client(
             MqttPacket::PingReq => {
                 let _ = tx.send(encode_pingresp());
             }
-            MqttPacket::Disconnect { .. } => {
-                graceful = true;
-                break;
+            MqttPacket::Disconnect {
+                session_expiry_interval,
+                ..
+            } => {
+                let deliveries = broker.lock().expect("broker lock poisoned").disconnect(
+                    &client_id,
+                    true,
+                    session_expiry_interval,
+                );
+                send_deliveries(protocol, &outbound, deliveries);
+                outbound
+                    .lock()
+                    .expect("outbound lock poisoned")
+                    .remove(&client_id);
+                return Ok(());
             }
             MqttPacket::PubAck { .. } | MqttPacket::PubRec { .. } | MqttPacket::PubComp { .. } => {}
             MqttPacket::Connect { .. } => break,
@@ -305,7 +345,7 @@ fn handle_client(
     let deliveries = broker
         .lock()
         .expect("broker lock poisoned")
-        .disconnect(&client_id, graceful);
+        .disconnect(&client_id, false, None);
     send_deliveries(protocol, &outbound, deliveries);
     Ok(())
 }
