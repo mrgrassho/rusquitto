@@ -13,6 +13,18 @@ pub struct Subscription {
     pub retain_handling: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Qos2OutboundState {
+    WaitingPubRec,
+    WaitingPubComp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qos2Outbound {
+    pub publication: Publication,
+    pub state: Qos2OutboundState,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientSession {
     pub client_id: String,
@@ -20,6 +32,8 @@ pub struct ClientSession {
     pub will: Option<Will>,
     pub queued: Vec<Publication>,
     pub inflight_qos1: BTreeMap<u16, Publication>,
+    pub inflight_qos2: BTreeMap<u16, Qos2Outbound>,
+    pub inbound_qos2: BTreeMap<u16, Publication>,
     pub session_expiry_interval: u32,
     pub disconnected_at: Option<Instant>,
     pub online: bool,
@@ -64,6 +78,8 @@ impl BrokerState {
                     will,
                     queued: Vec::new(),
                     inflight_qos1: BTreeMap::new(),
+                    inflight_qos2: BTreeMap::new(),
+                    inbound_qos2: BTreeMap::new(),
                     session_expiry_interval,
                     disconnected_at: None,
                     online: true,
@@ -76,7 +92,7 @@ impl BrokerState {
             session.online = true;
         }
 
-        let queued = self
+        let (queued, pubrels) = self
             .clients
             .get_mut(&client_id)
             .map(|session| {
@@ -89,20 +105,54 @@ impl BrokerState {
                         publication
                     })
                     .collect();
+
+                pending.extend(session.inflight_qos2.values().filter_map(|outbound| {
+                    if outbound.state == Qos2OutboundState::WaitingPubRec {
+                        let mut publication = outbound.publication.clone();
+                        publication.dup = true;
+                        Some(publication)
+                    } else {
+                        None
+                    }
+                }));
+
+                let pubrels = session
+                    .inflight_qos2
+                    .iter()
+                    .filter_map(|(packet_id, outbound)| {
+                        (outbound.state == Qos2OutboundState::WaitingPubComp).then_some(*packet_id)
+                    })
+                    .collect();
+
                 let queued = std::mem::take(&mut session.queued);
-                for publication in queued.iter().filter(|publication| publication.qos == 1) {
+                for publication in &queued {
                     if let Some(packet_id) = publication.packet_id {
-                        session.inflight_qos1.insert(packet_id, publication.clone());
+                        match publication.qos {
+                            1 => {
+                                session.inflight_qos1.insert(packet_id, publication.clone());
+                            }
+                            2 => {
+                                session.inflight_qos2.insert(
+                                    packet_id,
+                                    Qos2Outbound {
+                                        publication: publication.clone(),
+                                        state: Qos2OutboundState::WaitingPubRec,
+                                    },
+                                );
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 pending.extend(queued);
-                pending
+                (pending, pubrels)
             })
             .unwrap_or_default();
 
         ConnectResult {
             session_present,
             queued,
+            pubrels,
         }
     }
 
@@ -213,15 +263,7 @@ impl BrokerState {
                 if retained_publication.qos > 0 {
                     retained_publication.packet_id = Some(self.next_packet_id());
                 }
-                if retained_publication.qos == 1 {
-                    if let Some(packet_id) = retained_publication.packet_id {
-                        if let Some(session) = self.clients.get_mut(client_id) {
-                            session
-                                .inflight_qos1
-                                .insert(packet_id, retained_publication.clone());
-                        }
-                    }
-                }
+                self.track_outgoing(client_id, &retained_publication);
                 retained.push(Delivery {
                     client_id: client_id.to_owned(),
                     publication: retained_publication,
@@ -256,16 +298,85 @@ impl BrokerState {
             .is_some_and(|session| session.inflight_qos1.contains_key(&packet_id))
     }
 
+    pub fn receive_qos2_publish(
+        &mut self,
+        client_id: &str,
+        publication: Publication,
+    ) -> Qos2ReceiveResult {
+        let Some(packet_id) = publication.packet_id else {
+            return Qos2ReceiveResult {
+                accepted: false,
+                duplicate: false,
+            };
+        };
+        if publication.qos != 2 || !Self::valid_publication(&publication) {
+            return Qos2ReceiveResult {
+                accepted: false,
+                duplicate: false,
+            };
+        }
+
+        let Some(session) = self.clients.get_mut(client_id) else {
+            return Qos2ReceiveResult {
+                accepted: false,
+                duplicate: false,
+            };
+        };
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            session.inbound_qos2.entry(packet_id)
+        {
+            entry.insert(publication);
+            Qos2ReceiveResult {
+                accepted: true,
+                duplicate: false,
+            }
+        } else {
+            Qos2ReceiveResult {
+                accepted: true,
+                duplicate: true,
+            }
+        }
+    }
+
+    pub fn pubrel(&mut self, client_id: &str, packet_id: u16) -> Option<PublishResult> {
+        let publication = self
+            .clients
+            .get_mut(client_id)
+            .and_then(|session| session.inbound_qos2.remove(&packet_id));
+        publication.map(|publication| self.publish(client_id, publication))
+    }
+
+    pub fn pubrec(&mut self, client_id: &str, packet_id: u16) -> bool {
+        let Some(outbound) = self
+            .clients
+            .get_mut(client_id)
+            .and_then(|session| session.inflight_qos2.get_mut(&packet_id))
+        else {
+            return false;
+        };
+        outbound.state = Qos2OutboundState::WaitingPubComp;
+        true
+    }
+
+    pub fn pubcomp(&mut self, client_id: &str, packet_id: u16) -> bool {
+        self.clients
+            .get_mut(client_id)
+            .and_then(|session| session.inflight_qos2.remove(&packet_id))
+            .is_some()
+    }
+
+    pub fn has_inflight_qos2(&self, client_id: &str, packet_id: u16) -> bool {
+        self.clients
+            .get(client_id)
+            .is_some_and(|session| session.inflight_qos2.contains_key(&packet_id))
+    }
+
     pub fn publish(
         &mut self,
         source_client_id: &str,
         mut publication: Publication,
     ) -> PublishResult {
-        let mut accepted = topic::check_publish_topic(&publication.topic).is_ok();
-        if publication.qos > 2 {
-            accepted = false;
-        }
-        if !accepted {
+        if !Self::valid_publication(&publication) {
             return PublishResult {
                 accepted: false,
                 deliveries: Vec::new(),
@@ -307,13 +418,7 @@ impl BrokerState {
             outgoing.retain = retain_as_published && outgoing.retain;
             outgoing.packet_id = (outgoing.qos > 0).then(|| self.next_packet_id());
             if online {
-                if outgoing.qos == 1 {
-                    if let Some(packet_id) = outgoing.packet_id {
-                        if let Some(session) = self.clients.get_mut(&client_id) {
-                            session.inflight_qos1.insert(packet_id, outgoing.clone());
-                        }
-                    }
-                }
+                self.track_outgoing(&client_id, &outgoing);
                 deliveries.push(Delivery {
                     client_id,
                     publication: outgoing,
@@ -328,6 +433,34 @@ impl BrokerState {
         PublishResult {
             accepted: true,
             deliveries,
+        }
+    }
+
+    fn valid_publication(publication: &Publication) -> bool {
+        topic::check_publish_topic(&publication.topic).is_ok() && publication.qos <= 2
+    }
+
+    fn track_outgoing(&mut self, client_id: &str, publication: &Publication) {
+        let Some(packet_id) = publication.packet_id else {
+            return;
+        };
+        let Some(session) = self.clients.get_mut(client_id) else {
+            return;
+        };
+        match publication.qos {
+            1 => {
+                session.inflight_qos1.insert(packet_id, publication.clone());
+            }
+            2 => {
+                session.inflight_qos2.insert(
+                    packet_id,
+                    Qos2Outbound {
+                        publication: publication.clone(),
+                        state: Qos2OutboundState::WaitingPubRec,
+                    },
+                );
+            }
+            _ => {}
         }
     }
 
@@ -362,6 +495,7 @@ impl BrokerState {
 pub struct ConnectResult {
     pub session_present: bool,
     pub queued: Vec<Publication>,
+    pub pubrels: Vec<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -374,6 +508,12 @@ pub struct SubscribeResult {
 pub struct PublishResult {
     pub accepted: bool,
     pub deliveries: Vec<Delivery>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qos2ReceiveResult {
+    pub accepted: bool,
+    pub duplicate: bool,
 }
 
 #[cfg(test)]
@@ -542,6 +682,148 @@ mod tests {
         assert_eq!(reconnect.queued[0].packet_id, Some(packet_id));
         assert!(reconnect.queued[0].dup);
         assert!(broker.has_inflight_qos1("sub", packet_id));
+    }
+
+    #[test]
+    fn tracks_qos2_deliveries_until_pubrec_pubcomp() {
+        let mut broker = BrokerState::new();
+        broker.connect("sub".into(), false, None, 60);
+        broker.subscribe(
+            "sub",
+            vec![SubscriptionRequest {
+                filter: "online/qos2".into(),
+                qos: 2,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+            }],
+        );
+
+        let mut outgoing = publication("online/qos2", false);
+        outgoing.qos = 2;
+        let publish_result = broker.publish("pub", outgoing);
+        assert_eq!(publish_result.deliveries.len(), 1);
+        let packet_id = publish_result.deliveries[0].publication.packet_id.unwrap();
+        assert!(broker.has_inflight_qos2("sub", packet_id));
+        assert_eq!(
+            broker.clients["sub"].inflight_qos2[&packet_id].state,
+            Qos2OutboundState::WaitingPubRec
+        );
+
+        assert!(broker.pubrec("sub", packet_id));
+        assert_eq!(
+            broker.clients["sub"].inflight_qos2[&packet_id].state,
+            Qos2OutboundState::WaitingPubComp
+        );
+        assert!(broker.pubrec("sub", packet_id));
+        assert!(broker.pubcomp("sub", packet_id));
+        assert!(!broker.has_inflight_qos2("sub", packet_id));
+        assert!(!broker.pubcomp("sub", packet_id));
+    }
+
+    #[test]
+    fn holds_inbound_qos2_until_pubrel() {
+        let mut broker = BrokerState::new();
+        broker.connect("sub".into(), true, None, 0);
+        broker.subscribe(
+            "sub",
+            vec![SubscriptionRequest {
+                filter: "inbound/qos2".into(),
+                qos: 0,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+            }],
+        );
+        broker.connect("pub".into(), true, None, 0);
+
+        let mut inbound = publication("inbound/qos2", false);
+        inbound.qos = 2;
+        inbound.packet_id = Some(7);
+        let first = broker.receive_qos2_publish("pub", inbound.clone());
+        assert!(first.accepted);
+        assert!(!first.duplicate);
+        assert_eq!(broker.clients["pub"].inbound_qos2.len(), 1);
+
+        let duplicate = broker.receive_qos2_publish("pub", inbound);
+        assert!(duplicate.accepted);
+        assert!(duplicate.duplicate);
+        assert_eq!(broker.clients["pub"].inbound_qos2.len(), 1);
+
+        let released = broker.pubrel("pub", 7).unwrap();
+        assert!(released.accepted);
+        assert_eq!(released.deliveries.len(), 1);
+        assert_eq!(released.deliveries[0].client_id, "sub");
+        assert!(broker.pubrel("pub", 7).is_none());
+    }
+
+    #[test]
+    fn replays_qos2_publish_or_pubrel_on_reconnect() {
+        let mut broker = BrokerState::new();
+        broker.connect("sub".into(), false, None, 60);
+        broker.subscribe(
+            "sub",
+            vec![SubscriptionRequest {
+                filter: "replay/qos2".into(),
+                qos: 2,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+            }],
+        );
+
+        let mut outgoing = publication("replay/qos2", false);
+        outgoing.qos = 2;
+        let publish_result = broker.publish("pub", outgoing);
+        let packet_id = publish_result.deliveries[0].publication.packet_id.unwrap();
+        broker.disconnect("sub", true, None);
+
+        let reconnect = broker.connect("sub".into(), false, None, 60);
+        assert!(reconnect.session_present);
+        assert_eq!(reconnect.queued.len(), 1);
+        assert_eq!(reconnect.queued[0].packet_id, Some(packet_id));
+        assert!(reconnect.queued[0].dup);
+        assert!(reconnect.pubrels.is_empty());
+
+        assert!(broker.pubrec("sub", packet_id));
+        broker.disconnect("sub", true, None);
+        let reconnect = broker.connect("sub".into(), false, None, 60);
+        assert!(reconnect.queued.is_empty());
+        assert_eq!(reconnect.pubrels, vec![packet_id]);
+        assert!(broker.pubcomp("sub", packet_id));
+    }
+
+    #[test]
+    fn queues_qos2_messages_for_offline_durable_sessions() {
+        let mut broker = BrokerState::new();
+        broker.connect("sub".into(), false, None, 60);
+        broker.subscribe(
+            "sub",
+            vec![SubscriptionRequest {
+                filter: "offline/qos2".into(),
+                qos: 2,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+            }],
+        );
+        broker.disconnect("sub", true, None);
+
+        let mut queued = publication("offline/qos2", false);
+        queued.qos = 2;
+        let publish_result = broker.publish("pub", queued);
+        assert!(publish_result.accepted);
+        assert!(publish_result.deliveries.is_empty());
+
+        let reconnect = broker.connect("sub".into(), false, None, 60);
+        assert!(reconnect.session_present);
+        assert_eq!(reconnect.queued.len(), 1);
+        assert_eq!(reconnect.queued[0].topic, "offline/qos2");
+        assert_eq!(reconnect.queued[0].qos, 2);
+        assert_eq!(reconnect.queued[0].packet_id, Some(1));
+        assert!(!reconnect.queued[0].dup);
+        assert!(reconnect.pubrels.is_empty());
+        assert!(broker.has_inflight_qos2("sub", 1));
     }
 
     #[test]
