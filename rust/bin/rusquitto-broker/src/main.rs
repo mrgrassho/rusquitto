@@ -1,25 +1,32 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, ErrorKind, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use rusquitto_core::BrokerState;
 use rusquitto_protocol::{
     decode_frame, encode_connack, encode_disconnect, encode_pingresp, encode_puback,
-    encode_pubcomp, encode_publish, encode_pubrec, encode_suback, encode_unsuback, read_frame,
-    MqttPacket, ProtocolVersion, Publication,
+    encode_pubcomp, encode_publish, encode_pubrec, encode_pubrel, encode_suback, encode_unsuback,
+    read_frame, MqttPacket, ProtocolVersion, Publication,
 };
 
 const MQTT_RC_MALFORMED_PACKET: u8 = 0x81;
 const MQTT_RC_PROTOCOL_ERROR: u8 = 0x82;
 const MQTT_RC_NOT_AUTHORIZED: u8 = 0x87;
 
-type OutboundMap = Arc<Mutex<HashMap<String, Sender<Vec<u8>>>>>;
+type OutboundMap = Arc<Mutex<HashMap<String, ClientOutbound>>>;
 type SharedBroker = Arc<Mutex<BrokerState>>;
+
+#[derive(Debug, Clone)]
+struct ClientOutbound {
+    protocol: ProtocolVersion,
+    sender: Sender<Vec<u8>>,
+}
 
 #[derive(Debug, Clone)]
 struct Settings {
@@ -53,11 +60,18 @@ fn run() -> Result<(), String> {
         eprintln!("Opening ipv4 listen socket on port {}.", settings.port);
     }
 
+    shutdown::install();
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+
     let broker = Arc::new(Mutex::new(BrokerState::new()));
     let outbound = Arc::new(Mutex::new(HashMap::new()));
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
+    while !shutdown::requested() {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if let Err(err) = stream.set_nonblocking(false) {
+                    eprintln!("Client setup error: {err}");
+                    continue;
+                }
                 let broker = Arc::clone(&broker);
                 let outbound = Arc::clone(&outbound);
                 let settings = settings.clone();
@@ -67,12 +81,53 @@ fn run() -> Result<(), String> {
                     }
                 });
             }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(err) if err.kind() == ErrorKind::Interrupted => {}
             Err(err) => {
                 eprintln!("Accept error: {err}");
             }
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+mod shutdown {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static REQUESTED: AtomicBool = AtomicBool::new(false);
+
+    type SignalHandler = extern "C" fn(i32);
+
+    extern "C" {
+        fn signal(signum: i32, handler: SignalHandler) -> SignalHandler;
+    }
+
+    extern "C" fn handle_signal(_signum: i32) {
+        REQUESTED.store(true, Ordering::SeqCst);
+    }
+
+    pub fn install() {
+        unsafe {
+            let _ = signal(2, handle_signal);
+            let _ = signal(15, handle_signal);
+        }
+    }
+
+    pub fn requested() -> bool {
+        REQUESTED.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(not(unix))]
+mod shutdown {
+    pub fn install() {}
+
+    pub fn requested() -> bool {
+        false
+    }
 }
 
 fn bind_listener(port: u16) -> Result<TcpListener, String> {
@@ -236,10 +291,13 @@ fn handle_client(
     stream.write_all(&encode_connack(protocol, connect_result.session_present, 0))?;
 
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    outbound
-        .lock()
-        .expect("outbound lock poisoned")
-        .insert(client_id.clone(), tx.clone());
+    outbound.lock().expect("outbound lock poisoned").insert(
+        client_id.clone(),
+        ClientOutbound {
+            protocol,
+            sender: tx.clone(),
+        },
+    );
 
     let mut writer = stream.try_clone()?;
     thread::spawn(move || {
@@ -252,6 +310,9 @@ fn handle_client(
 
     for publication in connect_result.queued {
         let _ = tx.send(encode_publish(protocol, &publication));
+    }
+    for packet_id in connect_result.pubrels {
+        let _ = tx.send(encode_pubrel(protocol, packet_id));
     }
 
     let mut topic_aliases: HashMap<u16, String> = HashMap::new();
@@ -275,38 +336,95 @@ fn handle_client(
                     break;
                 }
 
-                if publication.qos == 1 {
-                    if let Some(packet_id) = publication.packet_id {
-                        let _ = tx.send(encode_puback(protocol, packet_id));
+                match publication.qos {
+                    1 => {
+                        let packet_id = publication.packet_id;
+                        let result = broker
+                            .lock()
+                            .expect("broker lock poisoned")
+                            .publish(&client_id, publication);
+                        if !result.accepted {
+                            if protocol == ProtocolVersion::V5 {
+                                let _ =
+                                    tx.send(encode_disconnect(protocol, MQTT_RC_MALFORMED_PACKET));
+                            }
+                            break;
+                        }
+                        send_deliveries(protocol, &outbound, result.deliveries);
+                        if let Some(packet_id) = packet_id {
+                            let _ = tx.send(encode_puback(protocol, packet_id));
+                        }
                     }
-                } else if publication.qos == 2 {
-                    if let Some(packet_id) = publication.packet_id {
+                    2 => {
+                        let Some(packet_id) = publication.packet_id else {
+                            if protocol == ProtocolVersion::V5 {
+                                let _ =
+                                    tx.send(encode_disconnect(protocol, MQTT_RC_MALFORMED_PACKET));
+                            }
+                            break;
+                        };
+                        let result = broker
+                            .lock()
+                            .expect("broker lock poisoned")
+                            .receive_qos2_publish(&client_id, publication);
+                        if !result.accepted {
+                            if protocol == ProtocolVersion::V5 {
+                                let _ =
+                                    tx.send(encode_disconnect(protocol, MQTT_RC_MALFORMED_PACKET));
+                            }
+                            break;
+                        }
                         let _ = tx.send(encode_pubrec(protocol, packet_id));
                     }
+                    _ => {
+                        let result = broker
+                            .lock()
+                            .expect("broker lock poisoned")
+                            .publish(&client_id, publication);
+                        if !result.accepted {
+                            if protocol == ProtocolVersion::V5 {
+                                let _ =
+                                    tx.send(encode_disconnect(protocol, MQTT_RC_MALFORMED_PACKET));
+                            }
+                            break;
+                        }
+                        send_deliveries(protocol, &outbound, result.deliveries);
+                    }
                 }
-
+            }
+            MqttPacket::PubRel { packet_id } => {
                 let result = broker
                     .lock()
                     .expect("broker lock poisoned")
-                    .publish(&client_id, publication);
-                if !result.accepted {
-                    if protocol == ProtocolVersion::V5 {
-                        let _ = tx.send(encode_disconnect(protocol, MQTT_RC_MALFORMED_PACKET));
+                    .pubrel(&client_id, packet_id);
+                if let Some(result) = result {
+                    if !result.accepted {
+                        if protocol == ProtocolVersion::V5 {
+                            let _ = tx.send(encode_disconnect(protocol, MQTT_RC_MALFORMED_PACKET));
+                        }
+                        break;
                     }
-                    break;
+                    send_deliveries(protocol, &outbound, result.deliveries);
                 }
-                send_deliveries(protocol, &outbound, result.deliveries);
-            }
-            MqttPacket::PubRel { packet_id } => {
                 let _ = tx.send(encode_pubcomp(protocol, packet_id));
             }
             MqttPacket::PubAck { packet_id } => {
+                let invalid_qos2_ack = broker
+                    .lock()
+                    .expect("broker lock poisoned")
+                    .has_inflight_qos2(&client_id, packet_id);
+                if invalid_qos2_ack {
+                    if protocol == ProtocolVersion::V5 {
+                        let _ = tx.send(encode_disconnect(protocol, MQTT_RC_PROTOCOL_ERROR));
+                    }
+                    break;
+                }
                 broker
                     .lock()
                     .expect("broker lock poisoned")
                     .puback(&client_id, packet_id);
             }
-            MqttPacket::PubRec { packet_id } | MqttPacket::PubComp { packet_id } => {
+            MqttPacket::PubRec { packet_id } => {
                 let invalid_qos1_ack = broker
                     .lock()
                     .expect("broker lock poisoned")
@@ -317,12 +435,41 @@ fn handle_client(
                     }
                     break;
                 }
+                let send_pubrel = broker
+                    .lock()
+                    .expect("broker lock poisoned")
+                    .pubrec(&client_id, packet_id);
+                if send_pubrel {
+                    let _ = tx.send(encode_pubrel(protocol, packet_id));
+                }
+            }
+            MqttPacket::PubComp { packet_id } => {
+                let invalid_qos1_ack = broker
+                    .lock()
+                    .expect("broker lock poisoned")
+                    .has_inflight_qos1(&client_id, packet_id);
+                if invalid_qos1_ack {
+                    if protocol == ProtocolVersion::V5 {
+                        let _ = tx.send(encode_disconnect(protocol, MQTT_RC_PROTOCOL_ERROR));
+                    }
+                    break;
+                }
+                broker
+                    .lock()
+                    .expect("broker lock poisoned")
+                    .pubcomp(&client_id, packet_id);
             }
             MqttPacket::Subscribe { packet_id, filters } => {
                 let result = broker
                     .lock()
                     .expect("broker lock poisoned")
                     .subscribe(&client_id, filters);
+                if result.reason_codes.iter().any(|code| *code == 0x80) {
+                    if protocol == ProtocolVersion::V5 {
+                        let _ = tx.send(encode_disconnect(protocol, MQTT_RC_MALFORMED_PACKET));
+                    }
+                    break;
+                }
                 let _ = tx.send(encode_suback(protocol, packet_id, &result.reason_codes));
                 send_deliveries(protocol, &outbound, result.retained);
             }
@@ -388,14 +535,16 @@ fn resolve_topic_alias(
 }
 
 fn send_deliveries(
-    protocol: ProtocolVersion,
+    _source_protocol: ProtocolVersion,
     outbound: &OutboundMap,
     deliveries: Vec<rusquitto_core::Delivery>,
 ) {
     let map = outbound.lock().expect("outbound lock poisoned");
     for delivery in deliveries {
-        if let Some(sender) = map.get(&delivery.client_id) {
-            let _ = sender.send(encode_publish(protocol, &delivery.publication));
+        if let Some(client) = map.get(&delivery.client_id) {
+            let _ = client
+                .sender
+                .send(encode_publish(client.protocol, &delivery.publication));
         }
     }
 }

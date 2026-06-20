@@ -20,6 +20,8 @@ export BUILD_ROOT="$test_root"
     python3 02-subpub-qos0-long-topic.py
     python3 02-subpub-qos0-send-retain.py
     python3 02-subpub-qos0-topic-alias.py
+    python3 03-publish-b2c-disconnect-qos2.py
+    python3 03-publish-b2c-qos2-len.py
     python3 04-retain-qos0-repeated.py
     python3 07-will-qos0.py
 )

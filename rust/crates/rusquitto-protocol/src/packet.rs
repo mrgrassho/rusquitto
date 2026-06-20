@@ -419,7 +419,17 @@ pub fn encode_connack(
 ) -> Vec<u8> {
     let mut body = vec![u8::from(session_present), reason_code];
     if protocol == ProtocolVersion::V5 {
-        body.push(0);
+        if reason_code == 0 {
+            body.push(11);
+            body.push(PROP_TOPIC_ALIAS_MAXIMUM as u8);
+            write_u16(10, &mut body);
+            body.push(PROP_MAXIMUM_PACKET_SIZE as u8);
+            write_u32(2_000_000, &mut body);
+            body.push(PROP_RECEIVE_MAXIMUM as u8);
+            write_u16(20, &mut body);
+        } else {
+            body.push(0);
+        }
     }
     encode_frame(CMD_CONNACK, 0, &body)
 }
@@ -473,17 +483,19 @@ pub fn encode_pubrec(protocol: ProtocolVersion, packet_id: u16) -> Vec<u8> {
     encode_ack(CMD_PUBREC, 0, protocol, packet_id)
 }
 
+pub fn encode_pubrel(_protocol: ProtocolVersion, packet_id: u16) -> Vec<u8> {
+    let mut body = Vec::new();
+    write_u16(packet_id, &mut body);
+    encode_frame(CMD_PUBREL, 0x02, &body)
+}
+
 pub fn encode_pubcomp(protocol: ProtocolVersion, packet_id: u16) -> Vec<u8> {
     encode_ack(CMD_PUBCOMP, 0, protocol, packet_id)
 }
 
-fn encode_ack(command: u8, flags: u8, protocol: ProtocolVersion, packet_id: u16) -> Vec<u8> {
+fn encode_ack(command: u8, flags: u8, _protocol: ProtocolVersion, packet_id: u16) -> Vec<u8> {
     let mut body = Vec::new();
     write_u16(packet_id, &mut body);
-    if protocol == ProtocolVersion::V5 {
-        body.push(0);
-        body.push(0);
-    }
     encode_frame(command, flags, &body)
 }
 
@@ -515,6 +527,10 @@ fn write_varint(mut value: u32, out: &mut Vec<u8>) {
 }
 
 fn write_u16(value: u16, out: &mut Vec<u8>) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn write_u32(value: u32, out: &mut Vec<u8>) {
     out.extend_from_slice(&value.to_be_bytes());
 }
 
@@ -716,6 +732,22 @@ mod tests {
     }
 
     #[test]
+    fn encodes_mqtt_v5_connack_properties() {
+        assert_eq!(
+            encode_connack(ProtocolVersion::V5, false, 0),
+            vec![0x20, 14, 0, 0, 11, 0x22, 0, 10, 0x27, 0, 0x1E, 0x84, 0x80, 0x21, 0, 20,]
+        );
+    }
+
+    #[test]
+    fn encodes_mqtt_v5_error_connack_without_properties() {
+        assert_eq!(
+            encode_connack(ProtocolVersion::V5, false, 0x87),
+            vec![0x20, 3, 0, 0x87, 0]
+        );
+    }
+
+    #[test]
     fn decodes_mqtt_v5_connect() {
         let body = [
             0, 4, b'M', b'Q', b'T', b'T', 5, 2, 0, 60, 0, 0, 6, b'c', b'l', b'i', b'e', b'n', b't',
@@ -851,6 +883,18 @@ mod tests {
             },
         );
         assert_eq!(encoded, vec![0x3A, 6, 0, 1, b'a', 0x12, 0x34, b'p']);
+    }
+
+    #[test]
+    fn encodes_pubrel_with_required_flags() {
+        assert_eq!(
+            encode_pubrel(ProtocolVersion::V311, 0x1234),
+            vec![0x62, 2, 0x12, 0x34]
+        );
+        assert_eq!(
+            encode_pubrel(ProtocolVersion::V5, 0x1234),
+            vec![0x62, 2, 0x12, 0x34]
+        );
     }
 
     #[test]
