@@ -17,6 +17,7 @@ export BUILD_ROOT="$test_root"
     cd test/broker
     python3 01-connect-allow-anonymous.py
     python3 01-connect-disconnect-v5.py
+    python3 02-shared-qos0-v5.py
     python3 02-subpub-qos0-long-topic.py
     python3 02-subpub-qos0-subscription-id.py
     python3 02-subpub-qos0-send-retain.py

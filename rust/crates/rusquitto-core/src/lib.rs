@@ -12,6 +12,22 @@ pub struct Subscription {
     pub retain_as_published: bool,
     pub retain_handling: u8,
     pub identifier: Option<u32>,
+    pub order: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeliverySpec {
+    client_id: String,
+    qos: u8,
+    retain_as_published: bool,
+    identifier: Option<u32>,
+    online: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SharedDeliveryCandidate {
+    order: u64,
+    spec: DeliverySpec,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,13 +66,16 @@ pub struct Delivery {
 pub struct BrokerState {
     clients: HashMap<String, ClientSession>,
     retained: HashMap<String, Publication>,
+    shared_cursors: HashMap<(String, String), usize>,
     next_outgoing_mid: u16,
+    next_subscription_order: u64,
 }
 
 impl BrokerState {
     pub fn new() -> Self {
         Self {
             next_outgoing_mid: 1,
+            next_subscription_order: 1,
             ..Self::default()
         }
     }
@@ -211,6 +230,7 @@ impl BrokerState {
         let mut reason_codes = Vec::with_capacity(filters.len());
         let mut retained = Vec::new();
         let mut replay_filters = Vec::new();
+        let mut next_subscription_order = self.next_subscription_order;
 
         let Some(session) = self.clients.get_mut(client_id) else {
             return SubscribeResult {
@@ -231,6 +251,14 @@ impl BrokerState {
             }
 
             let existed = session.subscriptions.contains_key(&request.filter);
+            let order = session.subscriptions.get(&request.filter).map_or_else(
+                || {
+                    let order = next_subscription_order;
+                    next_subscription_order += 1;
+                    order
+                },
+                |subscription| subscription.order,
+            );
             let subscription = Subscription {
                 filter: request.filter.clone(),
                 qos: request.qos,
@@ -238,6 +266,7 @@ impl BrokerState {
                 retain_as_published: request.retain_as_published,
                 retain_handling: request.retain_handling,
                 identifier: request.identifier,
+                order,
             };
             session
                 .subscriptions
@@ -253,6 +282,7 @@ impl BrokerState {
                 replay_filters.push(subscription);
             }
         }
+        self.next_subscription_order = next_subscription_order;
 
         for subscription in replay_filters {
             let matching: Vec<Publication> = self
@@ -409,40 +439,66 @@ impl BrokerState {
 
         let mut deliveries = Vec::new();
         let mut delivery_specs = Vec::new();
+        let mut shared_candidates: HashMap<(String, String), Vec<SharedDeliveryCandidate>> =
+            HashMap::new();
         for (client_id, session) in &self.clients {
+            let mut normal_delivery = None;
             for subscription in session.subscriptions.values() {
                 if subscription.no_local && client_id == source_client_id {
                     continue;
                 }
-                if topic::matches(&subscription.filter, &publication.topic) {
-                    delivery_specs.push((
-                        client_id.clone(),
-                        subscription.qos.min(publication.qos),
-                        subscription.retain_as_published,
-                        subscription.identifier,
-                        session.online,
-                    ));
-                    break;
+                let spec = DeliverySpec {
+                    client_id: client_id.clone(),
+                    qos: subscription.qos.min(publication.qos),
+                    retain_as_published: subscription.retain_as_published,
+                    identifier: subscription.identifier,
+                    online: session.online,
+                };
+                if let Some((group, shared_filter)) = topic::shared_filter(&subscription.filter) {
+                    if topic::matches(shared_filter, &publication.topic) {
+                        shared_candidates
+                            .entry((group.to_owned(), shared_filter.to_owned()))
+                            .or_default()
+                            .push(SharedDeliveryCandidate {
+                                order: subscription.order,
+                                spec,
+                            });
+                    }
+                } else if normal_delivery.is_none()
+                    && topic::matches(&subscription.filter, &publication.topic)
+                {
+                    normal_delivery = Some(spec);
                 }
+            }
+            if let Some(spec) = normal_delivery {
+                delivery_specs.push(spec);
             }
         }
 
-        for (client_id, qos, retain_as_published, identifier, online) in delivery_specs {
-            publication.qos = qos;
+        for (key, mut candidates) in shared_candidates {
+            candidates.sort_by_key(|candidate| candidate.order);
+            let cursor = self.shared_cursors.entry(key).or_default();
+            let selected = *cursor % candidates.len();
+            delivery_specs.push(candidates[selected].spec.clone());
+            *cursor = (*cursor + 1) % candidates.len();
+        }
+
+        for spec in delivery_specs {
             let mut outgoing = publication.clone();
-            outgoing.retain = retain_as_published && outgoing.retain;
-            if let Some(identifier) = identifier {
+            outgoing.qos = spec.qos;
+            outgoing.retain = spec.retain_as_published && outgoing.retain;
+            if let Some(identifier) = spec.identifier {
                 outgoing.subscription_identifiers.push(identifier);
             }
             outgoing.packet_id = (outgoing.qos > 0).then(|| self.next_packet_id());
-            if online {
-                self.track_outgoing(&client_id, &outgoing);
+            if spec.online {
+                self.track_outgoing(&spec.client_id, &outgoing);
                 deliveries.push(Delivery {
-                    client_id,
+                    client_id: spec.client_id,
                     publication: outgoing,
                 });
             } else if outgoing.qos > 0 {
-                if let Some(session) = self.clients.get_mut(&client_id) {
+                if let Some(session) = self.clients.get_mut(&spec.client_id) {
                     session.queued.push(outgoing);
                 }
             }
@@ -551,6 +607,16 @@ mod tests {
         }
     }
 
+    fn delivered_clients(result: &PublishResult) -> Vec<&str> {
+        let mut clients: Vec<_> = result
+            .deliveries
+            .iter()
+            .map(|delivery| delivery.client_id.as_str())
+            .collect();
+        clients.sort_unstable();
+        clients
+    }
+
     #[test]
     fn routes_matching_subscriptions() {
         let mut broker = BrokerState::new();
@@ -597,6 +663,70 @@ mod tests {
         assert_eq!(
             result.deliveries[0].publication.subscription_identifiers,
             vec![42]
+        );
+    }
+
+    #[test]
+    fn routes_shared_subscriptions_round_robin_by_group() {
+        let mut broker = BrokerState::new();
+        for client_id in ["client1", "client2", "client3", "client4", "client5"] {
+            broker.connect(client_id.into(), true, None, 0);
+        }
+
+        broker.subscribe(
+            "client1",
+            vec![SubscriptionRequest {
+                filter: "shared/#".into(),
+                qos: 0,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+                identifier: None,
+            }],
+        );
+        for client_id in ["client2", "client3", "client5"] {
+            broker.subscribe(
+                client_id,
+                vec![SubscriptionRequest {
+                    filter: "$share/one/shared/topic".into(),
+                    qos: 0,
+                    no_local: false,
+                    retain_as_published: false,
+                    retain_handling: 0,
+                    identifier: None,
+                }],
+            );
+        }
+        for client_id in ["client3", "client4"] {
+            broker.subscribe(
+                client_id,
+                vec![SubscriptionRequest {
+                    filter: "$share/two/shared/topic".into(),
+                    qos: 0,
+                    no_local: false,
+                    retain_as_published: false,
+                    retain_handling: 0,
+                    identifier: None,
+                }],
+            );
+        }
+
+        let first = broker.publish("client1", publication("shared/topic", false));
+        assert_eq!(
+            delivered_clients(&first),
+            vec!["client1", "client2", "client3"]
+        );
+
+        let second = broker.publish("client1", publication("shared/topic", false));
+        assert_eq!(
+            delivered_clients(&second),
+            vec!["client1", "client3", "client4"]
+        );
+
+        let third = broker.publish("client1", publication("shared/topic", false));
+        assert_eq!(
+            delivered_clients(&third),
+            vec!["client1", "client3", "client5"]
         );
     }
 

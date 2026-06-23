@@ -32,6 +32,22 @@ pub fn check_subscribe_topic(filter: &str) -> Result<(), TopicError> {
     if filter.len() > 65_535 {
         return Err(TopicError::TooLong);
     }
+    if filter.starts_with("$share/") {
+        let Some((group, shared_filter)) = shared_filter(filter) else {
+            return Err(TopicError::InvalidWildcard);
+        };
+        if group.is_empty()
+            || shared_filter.is_empty()
+            || group.bytes().any(|b| b == b'+' || b == b'#')
+        {
+            return Err(TopicError::InvalidWildcard);
+        }
+        return check_regular_subscribe_topic(shared_filter);
+    }
+    check_regular_subscribe_topic(filter)
+}
+
+fn check_regular_subscribe_topic(filter: &str) -> Result<(), TopicError> {
     let bytes = filter.as_bytes();
     for (idx, byte) in bytes.iter().copied().enumerate() {
         match byte {
@@ -60,7 +76,13 @@ pub fn check_subscribe_topic(filter: &str) -> Result<(), TopicError> {
     Ok(())
 }
 
+pub fn shared_filter(filter: &str) -> Option<(&str, &str)> {
+    let rest = filter.strip_prefix("$share/")?;
+    rest.split_once('/')
+}
+
 pub fn matches(filter: &str, topic: &str) -> bool {
+    let filter = shared_filter(filter).map_or(filter, |(_, shared_filter)| shared_filter);
     if filter.is_empty() || topic.is_empty() {
         return false;
     }
@@ -121,12 +143,30 @@ mod tests {
             Err(TopicError::InvalidWildcard)
         );
         assert_eq!(check_subscribe_topic("+/b"), Ok(()));
+        assert_eq!(check_subscribe_topic("$share/group/a/#"), Ok(()));
+        assert_eq!(
+            check_subscribe_topic("$share//a/#"),
+            Err(TopicError::InvalidWildcard)
+        );
+        assert_eq!(
+            check_subscribe_topic("$share/group/"),
+            Err(TopicError::InvalidWildcard)
+        );
+        assert_eq!(
+            check_subscribe_topic("$share/group"),
+            Err(TopicError::InvalidWildcard)
+        );
+        assert_eq!(
+            check_subscribe_topic("$share/+/a/#"),
+            Err(TopicError::InvalidWildcard)
+        );
     }
 
     #[test]
     fn matches_mqtt_filters() {
         assert!(matches("sensors/+/temp", "sensors/room/temp"));
         assert!(matches("sensors/#", "sensors/room/temp"));
+        assert!(matches("$share/group/sensors/#", "sensors/room/temp"));
         assert!(matches("/finance", "/finance"));
         assert!(!matches("sensors/+/temp", "sensors/room/humidity"));
         assert!(!matches("#", "$SYS/broker/uptime"));
