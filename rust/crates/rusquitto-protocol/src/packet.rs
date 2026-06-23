@@ -94,6 +94,7 @@ pub struct Publication {
     pub packet_id: Option<u16>,
     pub dup: bool,
     pub topic_alias: Option<u16>,
+    pub subscription_identifiers: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +104,7 @@ pub struct SubscriptionRequest {
     pub no_local: bool,
     pub retain_as_published: bool,
     pub retain_handling: u8,
+    pub identifier: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,10 +313,10 @@ fn decode_publish(
     } else {
         None
     };
-    let topic_alias = if current_protocol == Some(ProtocolVersion::V5) {
+    let publish_properties = if current_protocol == Some(ProtocolVersion::V5) {
         cursor.read_publish_properties()?
     } else {
-        None
+        PublishProperties::default()
     };
     let payload = cursor.read_remaining().to_vec();
     Ok(MqttPacket::Publish(Publication {
@@ -324,7 +326,8 @@ fn decode_publish(
         retain,
         packet_id,
         dup,
-        topic_alias,
+        topic_alias: publish_properties.topic_alias,
+        subscription_identifiers: publish_properties.subscription_identifiers,
     }))
 }
 
@@ -332,20 +335,28 @@ fn decode_subscribe(
     cursor: &mut Cursor<'_>,
     current_protocol: Option<ProtocolVersion>,
 ) -> Result<MqttPacket, ProtocolError> {
-    let packet_id = cursor.read_u16()?;
-    if current_protocol == Some(ProtocolVersion::V5) {
-        cursor.skip_properties()?;
-    }
+    let packet_id = read_packet_id(cursor)?;
+    let identifier = if current_protocol == Some(ProtocolVersion::V5) {
+        cursor.read_subscribe_properties()?
+    } else {
+        None
+    };
     let mut filters = Vec::new();
     while cursor.remaining() > 0 {
         let filter = cursor.read_utf8()?;
         let options = cursor.read_u8()?;
+        let qos = options & 0x03;
+        let retain_handling = (options & 0x30) >> 4;
+        if qos == 3 || retain_handling == 3 || (options & 0xC0) != 0 {
+            return Err(ProtocolError::MalformedPacket("invalid subscribe options"));
+        }
         filters.push(SubscriptionRequest {
             filter,
-            qos: options & 0x03,
+            qos,
             no_local: (options & 0x04) != 0,
             retain_as_published: (options & 0x08) != 0,
-            retain_handling: (options & 0x30) >> 4,
+            retain_handling,
+            identifier,
         });
     }
     if filters.is_empty() {
@@ -358,7 +369,7 @@ fn decode_unsubscribe(
     cursor: &mut Cursor<'_>,
     current_protocol: Option<ProtocolVersion>,
 ) -> Result<MqttPacket, ProtocolError> {
-    let packet_id = cursor.read_u16()?;
+    let packet_id = read_packet_id(cursor)?;
     if current_protocol == Some(ProtocolVersion::V5) {
         cursor.skip_properties()?;
     }
@@ -466,7 +477,13 @@ pub fn encode_publish(protocol: ProtocolVersion, publication: &Publication) -> V
         );
     }
     if protocol == ProtocolVersion::V5 {
-        body.push(0);
+        let mut properties = Vec::new();
+        for identifier in &publication.subscription_identifiers {
+            properties.push(PROP_SUBSCRIPTION_IDENTIFIER as u8);
+            write_varint(*identifier, &mut properties);
+        }
+        write_varint(properties.len() as u32, &mut body);
+        body.extend_from_slice(&properties);
     }
     body.extend_from_slice(&publication.payload);
     let flags = (if publication.dup { 0x08 } else { 0 })
@@ -542,6 +559,12 @@ fn write_utf8(value: &str, out: &mut Vec<u8>) {
 struct Cursor<'a> {
     bytes: &'a [u8],
     pos: usize,
+}
+
+#[derive(Debug, Default)]
+struct PublishProperties {
+    topic_alias: Option<u16>,
+    subscription_identifiers: Vec<u32>,
 }
 
 impl<'a> Cursor<'a> {
@@ -643,18 +666,28 @@ impl<'a> Cursor<'a> {
         Ok(session_expiry_interval)
     }
 
-    fn read_publish_properties(&mut self) -> Result<Option<u16>, ProtocolError> {
+    fn read_subscribe_properties(&mut self) -> Result<Option<u32>, ProtocolError> {
         let len = self.read_varint()? as usize;
         if self.remaining() < len {
             return Err(ProtocolError::MalformedPacket("truncated properties"));
         }
         let end = self.pos + len;
-        let mut topic_alias = None;
+        let mut subscription_identifier = None;
         while self.pos < end {
             let identifier = self.read_varint()?;
             match identifier {
-                PROP_TOPIC_ALIAS => {
-                    topic_alias = Some(self.read_u16()?);
+                PROP_SUBSCRIPTION_IDENTIFIER => {
+                    let value = self.read_varint()?;
+                    if value == 0 {
+                        return Err(ProtocolError::MalformedPacket(
+                            "zero subscription identifier",
+                        ));
+                    }
+                    if subscription_identifier.replace(value).is_some() {
+                        return Err(ProtocolError::MalformedPacket(
+                            "duplicate subscription identifier",
+                        ));
+                    }
                 }
                 _ => self.skip_property_value(identifier)?,
             }
@@ -662,7 +695,38 @@ impl<'a> Cursor<'a> {
         if self.pos != end {
             return Err(ProtocolError::MalformedPacket("property length mismatch"));
         }
-        Ok(topic_alias)
+        Ok(subscription_identifier)
+    }
+
+    fn read_publish_properties(&mut self) -> Result<PublishProperties, ProtocolError> {
+        let len = self.read_varint()? as usize;
+        if self.remaining() < len {
+            return Err(ProtocolError::MalformedPacket("truncated properties"));
+        }
+        let end = self.pos + len;
+        let mut properties = PublishProperties::default();
+        while self.pos < end {
+            let identifier = self.read_varint()?;
+            match identifier {
+                PROP_TOPIC_ALIAS => {
+                    properties.topic_alias = Some(self.read_u16()?);
+                }
+                PROP_SUBSCRIPTION_IDENTIFIER => {
+                    let value = self.read_varint()?;
+                    if value == 0 {
+                        return Err(ProtocolError::MalformedPacket(
+                            "zero subscription identifier",
+                        ));
+                    }
+                    properties.subscription_identifiers.push(value);
+                }
+                _ => self.skip_property_value(identifier)?,
+            }
+        }
+        if self.pos != end {
+            return Err(ProtocolError::MalformedPacket("property length mismatch"));
+        }
+        Ok(properties)
     }
 
     fn skip_property_value(&mut self, identifier: u32) -> Result<(), ProtocolError> {
@@ -880,9 +944,70 @@ mod tests {
                 packet_id: Some(0x1234),
                 dup: true,
                 topic_alias: None,
+                subscription_identifiers: Vec::new(),
             },
         );
         assert_eq!(encoded, vec![0x3A, 6, 0, 1, b'a', 0x12, 0x34, b'p']);
+    }
+
+    #[test]
+    fn decodes_mqtt_v5_subscription_identifier() {
+        let packet = decode_frame(
+            &Frame {
+                command: CMD_SUBSCRIBE,
+                flags: 2,
+                body: vec![0, 7, 2, 0x0B, 42, 0, 3, b'a', b'/', b'#', 1],
+            },
+            Some(ProtocolVersion::V5),
+        )
+        .unwrap();
+
+        match packet {
+            MqttPacket::Subscribe { packet_id, filters } => {
+                assert_eq!(packet_id, 7);
+                assert_eq!(filters.len(), 1);
+                assert_eq!(filters[0].filter, "a/#");
+                assert_eq!(filters[0].qos, 1);
+                assert_eq!(filters[0].identifier, Some(42));
+            }
+            other => panic!("unexpected packet: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_subscribe_options() {
+        for options in [0x03, 0x30, 0x80] {
+            let packet = decode_frame(
+                &Frame {
+                    command: CMD_SUBSCRIBE,
+                    flags: 2,
+                    body: vec![0, 7, 0, 0, 1, b'a', options],
+                },
+                Some(ProtocolVersion::V5),
+            );
+            assert!(matches!(packet, Err(ProtocolError::MalformedPacket(_))));
+        }
+    }
+
+    #[test]
+    fn encodes_mqtt_v5_publish_subscription_identifier() {
+        let encoded = encode_publish(
+            ProtocolVersion::V5,
+            &Publication {
+                topic: "a".into(),
+                payload: b"p".to_vec(),
+                qos: 0,
+                retain: false,
+                packet_id: None,
+                dup: false,
+                topic_alias: None,
+                subscription_identifiers: vec![321],
+            },
+        );
+        assert_eq!(
+            encoded,
+            vec![0x30, 8, 0, 1, b'a', 3, 0x0B, 0xC1, 0x02, b'p']
+        );
     }
 
     #[test]
@@ -915,6 +1040,7 @@ mod tests {
             MqttPacket::Publish(publication) => {
                 assert_eq!(publication.topic, "a");
                 assert_eq!(publication.topic_alias, Some(7));
+                assert!(publication.subscription_identifiers.is_empty());
                 assert_eq!(publication.payload, b"payload");
             }
             other => panic!("unexpected packet: {other:?}"),
