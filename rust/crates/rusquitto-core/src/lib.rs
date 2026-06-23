@@ -11,6 +11,7 @@ pub struct Subscription {
     pub no_local: bool,
     pub retain_as_published: bool,
     pub retain_handling: u8,
+    pub identifier: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +188,7 @@ impl BrokerState {
                 packet_id: None,
                 dup: false,
                 topic_alias: None,
+                subscription_identifiers: Vec::new(),
             };
             let deliveries = self.publish(client_id, publication).deliveries;
             if remove_session {
@@ -218,7 +220,11 @@ impl BrokerState {
         };
 
         for request in filters {
-            let valid = topic::check_subscribe_topic(&request.filter).is_ok() && request.qos <= 2;
+            let valid_identifier = request.identifier.map_or(true, |identifier| identifier > 0);
+            let valid = topic::check_subscribe_topic(&request.filter).is_ok()
+                && request.qos <= 2
+                && request.retain_handling <= 2
+                && valid_identifier;
             if !valid {
                 reason_codes.push(0x80);
                 continue;
@@ -231,6 +237,7 @@ impl BrokerState {
                 no_local: request.no_local,
                 retain_as_published: request.retain_as_published,
                 retain_handling: request.retain_handling,
+                identifier: request.identifier,
             };
             session
                 .subscriptions
@@ -260,6 +267,12 @@ impl BrokerState {
                 retained_publication.qos = retained_publication.qos.min(subscription.qos);
                 retained_publication.retain =
                     !subscription.retain_as_published || publication.retain;
+                retained_publication.subscription_identifiers.clear();
+                if let Some(identifier) = subscription.identifier {
+                    retained_publication
+                        .subscription_identifiers
+                        .push(identifier);
+                }
                 if retained_publication.qos > 0 {
                     retained_publication.packet_id = Some(self.next_packet_id());
                 }
@@ -382,6 +395,7 @@ impl BrokerState {
                 deliveries: Vec::new(),
             };
         }
+        publication.subscription_identifiers.clear();
 
         if publication.retain {
             if publication.payload.is_empty() {
@@ -405,6 +419,7 @@ impl BrokerState {
                         client_id.clone(),
                         subscription.qos.min(publication.qos),
                         subscription.retain_as_published,
+                        subscription.identifier,
                         session.online,
                     ));
                     break;
@@ -412,10 +427,13 @@ impl BrokerState {
             }
         }
 
-        for (client_id, qos, retain_as_published, online) in delivery_specs {
+        for (client_id, qos, retain_as_published, identifier, online) in delivery_specs {
             publication.qos = qos;
             let mut outgoing = publication.clone();
             outgoing.retain = retain_as_published && outgoing.retain;
+            if let Some(identifier) = identifier {
+                outgoing.subscription_identifiers.push(identifier);
+            }
             outgoing.packet_id = (outgoing.qos > 0).then(|| self.next_packet_id());
             if online {
                 self.track_outgoing(&client_id, &outgoing);
@@ -529,6 +547,7 @@ mod tests {
             packet_id: None,
             dup: false,
             topic_alias: None,
+            subscription_identifiers: Vec::new(),
         }
     }
 
@@ -544,12 +563,41 @@ mod tests {
                 no_local: false,
                 retain_as_published: false,
                 retain_handling: 0,
+                identifier: None,
             }],
         );
         let result = broker.publish("pub", publication("a/b/c", false));
         assert!(result.accepted);
         assert_eq!(result.deliveries.len(), 1);
         assert_eq!(result.deliveries[0].client_id, "sub");
+    }
+
+    #[test]
+    fn attaches_subscription_identifier_to_live_deliveries() {
+        let mut broker = BrokerState::new();
+        broker.connect("sub".into(), true, None, 0);
+        broker.subscribe(
+            "sub",
+            vec![SubscriptionRequest {
+                filter: "identified/#".into(),
+                qos: 0,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+                identifier: Some(42),
+            }],
+        );
+
+        let mut inbound = publication("identified/topic", false);
+        inbound.subscription_identifiers.push(99);
+        let result = broker.publish("pub", inbound);
+
+        assert!(result.accepted);
+        assert_eq!(result.deliveries.len(), 1);
+        assert_eq!(
+            result.deliveries[0].publication.subscription_identifiers,
+            vec![42]
+        );
     }
 
     #[test]
@@ -566,11 +614,38 @@ mod tests {
                 no_local: false,
                 retain_as_published: false,
                 retain_handling: 0,
+                identifier: None,
             }],
         );
         assert_eq!(result.reason_codes, vec![0]);
         assert_eq!(result.retained.len(), 1);
         assert!(result.retained[0].publication.retain);
+    }
+
+    #[test]
+    fn attaches_subscription_identifier_to_retained_replays() {
+        let mut broker = BrokerState::new();
+        broker.connect("pub".into(), true, None, 0);
+        broker.publish("pub", publication("retain/identified", true));
+        broker.connect("sub".into(), true, None, 0);
+
+        let result = broker.subscribe(
+            "sub",
+            vec![SubscriptionRequest {
+                filter: "retain/#".into(),
+                qos: 0,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+                identifier: Some(77),
+            }],
+        );
+
+        assert_eq!(result.retained.len(), 1);
+        assert_eq!(
+            result.retained[0].publication.subscription_identifiers,
+            vec![77]
+        );
     }
 
     #[test]
@@ -585,6 +660,7 @@ mod tests {
                 no_local: false,
                 retain_as_published: false,
                 retain_handling: 0,
+                identifier: None,
             }],
         );
         broker.connect(
@@ -615,6 +691,7 @@ mod tests {
                 no_local: false,
                 retain_as_published: false,
                 retain_handling: 0,
+                identifier: None,
             }],
         );
 
@@ -646,6 +723,7 @@ mod tests {
                 no_local: false,
                 retain_as_published: false,
                 retain_handling: 0,
+                identifier: None,
             }],
         );
 
@@ -667,6 +745,7 @@ mod tests {
                 no_local: false,
                 retain_as_published: false,
                 retain_handling: 0,
+                identifier: None,
             }],
         );
 
@@ -696,6 +775,7 @@ mod tests {
                 no_local: false,
                 retain_as_published: false,
                 retain_handling: 0,
+                identifier: None,
             }],
         );
 
@@ -733,6 +813,7 @@ mod tests {
                 no_local: false,
                 retain_as_published: false,
                 retain_handling: 0,
+                identifier: None,
             }],
         );
         broker.connect("pub".into(), true, None, 0);
@@ -769,6 +850,7 @@ mod tests {
                 no_local: false,
                 retain_as_published: false,
                 retain_handling: 0,
+                identifier: None,
             }],
         );
 
@@ -805,6 +887,7 @@ mod tests {
                 no_local: false,
                 retain_as_published: false,
                 retain_handling: 0,
+                identifier: None,
             }],
         );
         broker.disconnect("sub", true, None);
@@ -838,6 +921,7 @@ mod tests {
                 no_local: false,
                 retain_as_published: false,
                 retain_handling: 0,
+                identifier: None,
             }],
         );
         broker.disconnect("sub", true, None);
@@ -861,6 +945,34 @@ mod tests {
     }
 
     #[test]
+    fn queues_subscription_identifier_for_offline_durable_sessions() {
+        let mut broker = BrokerState::new();
+        broker.connect("sub".into(), false, None, 60);
+        broker.subscribe(
+            "sub",
+            vec![SubscriptionRequest {
+                filter: "offline/identified".into(),
+                qos: 1,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+                identifier: Some(88),
+            }],
+        );
+        broker.disconnect("sub", true, None);
+
+        let mut queued = publication("offline/identified", false);
+        queued.qos = 1;
+        let publish_result = broker.publish("pub", queued);
+        assert!(publish_result.accepted);
+        assert!(publish_result.deliveries.is_empty());
+
+        let reconnect = broker.connect("sub".into(), false, None, 60);
+        assert_eq!(reconnect.queued.len(), 1);
+        assert_eq!(reconnect.queued[0].subscription_identifiers, vec![88]);
+    }
+
+    #[test]
     fn expires_offline_sessions() {
         let mut broker = BrokerState::new();
         broker.connect("sub".into(), false, None, 1);
@@ -872,6 +984,7 @@ mod tests {
                 no_local: false,
                 retain_as_published: false,
                 retain_handling: 0,
+                identifier: None,
             }],
         );
         broker.disconnect("sub", true, None);
