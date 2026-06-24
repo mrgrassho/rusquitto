@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use rusquitto_core::BrokerState;
+use rusquitto_core::{BrokerState, PersistedSession, Subscription};
 use rusquitto_protocol::{
     decode_frame, encode_connack, encode_connack_with_retain_available, encode_disconnect,
     encode_pingresp, encode_puback, encode_pubcomp, encode_publish, encode_pubrec, encode_pubrel,
@@ -77,6 +77,8 @@ fn run() -> Result<(), String> {
     if let Some(path) = settings.persistence_db_file.as_deref() {
         let retained = sqlite_persistence::load_retained(path)?;
         broker_state.restore_retained(retained);
+        let sessions = sqlite_persistence::load_sessions(path)?;
+        broker_state.restore_sessions(sessions);
     }
     let broker = Arc::new(Mutex::new(broker_state));
     let outbound = Arc::new(Mutex::new(HashMap::new()));
@@ -106,11 +108,11 @@ fn run() -> Result<(), String> {
         }
     }
     if let Some(path) = settings.persistence_db_file.as_deref() {
-        let retained = broker
-            .lock()
-            .expect("broker lock poisoned")
-            .retained_snapshot();
-        sqlite_persistence::save_retained(path, &retained)?;
+        let (retained, sessions) = {
+            let broker = broker.lock().expect("broker lock poisoned");
+            (broker.retained_snapshot(), broker.session_snapshot())
+        };
+        sqlite_persistence::save(path, &retained, &sessions)?;
     }
     Ok(())
 }
@@ -308,7 +310,92 @@ mod sqlite_persistence {
         Ok(retained)
     }
 
-    pub fn save_retained(path: &str, retained: &[Publication]) -> Result<(), String> {
+    pub fn load_sessions(path: &str) -> Result<Vec<PersistedSession>, String> {
+        if !Path::new(path).exists() {
+            return Ok(Vec::new());
+        }
+        let output = Command::new("sqlite3")
+            .arg("-batch")
+            .arg("-separator")
+            .arg("\t")
+            .arg(path)
+            .arg(
+                "SELECT c.client_id, COALESCE(c.session_expiry_interval, 0), \
+                        COALESCE(s.topic, ''), COALESCE(s.subscription_options, 0), \
+                        COALESCE(s.subscription_identifier, 0) \
+                 FROM clients c LEFT JOIN subscriptions s ON c.client_id = s.client_id \
+                 ORDER BY c.client_id, s.topic;",
+            )
+            .output()
+            .map_err(|e| format!("unable to run sqlite3: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "unable to load session persistence: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        let mut sessions = Vec::new();
+        let mut current: Option<PersistedSession> = None;
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let mut parts = line.split('\t');
+            let Some(client_id) = parts.next() else {
+                continue;
+            };
+            if client_id.is_empty() {
+                continue;
+            }
+            let session_expiry_interval =
+                session_expiry_interval_from_db(parts.next().unwrap_or_default());
+            if session_expiry_interval == 0 {
+                continue;
+            }
+
+            let new_client = current
+                .as_ref()
+                .map_or(true, |session| session.client_id != client_id);
+            if new_client {
+                if let Some(session) = current.take() {
+                    sessions.push(session);
+                }
+                current = Some(PersistedSession {
+                    client_id: client_id.to_owned(),
+                    session_expiry_interval,
+                    subscriptions: Vec::new(),
+                });
+            }
+
+            let topic = parts.next().unwrap_or_default();
+            if topic.is_empty() {
+                continue;
+            }
+            let options = parts
+                .next()
+                .and_then(|value| value.parse::<u8>().ok())
+                .unwrap_or(0);
+            let identifier = parts
+                .next()
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|identifier| *identifier > 0);
+            if let Some(session) = current.as_mut() {
+                session.subscriptions.push(subscription_from_options(
+                    topic.to_owned(),
+                    options,
+                    identifier,
+                ));
+            }
+        }
+        if let Some(session) = current {
+            sessions.push(session);
+        }
+        Ok(sessions)
+    }
+
+    pub fn save(
+        path: &str,
+        retained: &[Publication],
+        sessions: &[PersistedSession],
+    ) -> Result<(), String> {
         if let Some(parent) = Path::new(path).parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)
@@ -321,19 +408,33 @@ mod sqlite_persistence {
         sql.push_str("PRAGMA journal_mode=WAL;\n");
         sql.push_str("PRAGMA foreign_keys = ON;\n");
         sql.push_str("PRAGMA synchronous=1;\n");
-        sql.push_str("CREATE TABLE IF NOT EXISTS base_msgs (store_id INT64 PRIMARY KEY,expiry_time INT64,topic STRING NOT NULL,payload BLOB,source_id STRING,source_username STRING,payloadlen INTEGER,source_mid INTEGER,source_port INTEGER,qos INTEGER,retain INTEGER,properties STRING);\n");
-        sql.push_str(
-            "CREATE TABLE IF NOT EXISTS retains (topic STRING PRIMARY KEY,store_id INT64);\n",
-        );
-        sql.push_str("CREATE TABLE IF NOT EXISTS clients (client_id TEXT PRIMARY KEY,username TEXT,connection_time INT64,will_delay_time INT64,session_expiry_time INT64,listener_port INT,max_packet_size INT,max_qos INT,retain_available INT,session_expiry_interval INT,will_delay_interval INT);\n");
-        sql.push_str("CREATE TABLE IF NOT EXISTS subscriptions (client_id TEXT NOT NULL,topic TEXT NOT NULL,subscription_options INTEGER,subscription_identifier INTEGER,PRIMARY KEY (client_id, topic) );\n");
-        sql.push_str("CREATE TABLE IF NOT EXISTS client_msgs (client_id TEXT NOT NULL,cmsg_id INT64,store_id INT64,dup INTEGER,direction INTEGER,mid INTEGER,qos INTEGER,retain INTEGER,state INTEGER,subscription_identifier INTEGER);\n");
+        append_schema(&mut sql);
         sql.push_str("BEGIN IMMEDIATE;\n");
         sql.push_str("DELETE FROM client_msgs;\n");
         sql.push_str("DELETE FROM subscriptions;\n");
         sql.push_str("DELETE FROM clients;\n");
         sql.push_str("DELETE FROM retains;\n");
         sql.push_str("DELETE FROM base_msgs;\n");
+        for session in sessions {
+            if session.client_id.is_empty() || session.session_expiry_interval == 0 {
+                continue;
+            }
+            sql.push_str(&format!(
+                "INSERT INTO clients(client_id,username,connection_time,will_delay_time,session_expiry_time,listener_port,max_packet_size,max_qos,retain_available,session_expiry_interval,will_delay_interval) VALUES ('{}',NULL,0,0,{},NULL,0,2,1,{},0);\n",
+                escape_sql(&session.client_id),
+                session_expiry_time(session.session_expiry_interval),
+                db_session_expiry_interval(session.session_expiry_interval),
+            ));
+            for subscription in &session.subscriptions {
+                sql.push_str(&format!(
+                    "INSERT INTO subscriptions(client_id,topic,subscription_options,subscription_identifier) VALUES ('{}','{}',{},{});\n",
+                    escape_sql(&session.client_id),
+                    escape_sql(&subscription.filter),
+                    subscription_options(subscription),
+                    subscription.identifier.unwrap_or(0),
+                ));
+            }
+        }
         for (idx, publication) in retained.iter().enumerate() {
             let store_id = idx + 1;
             sql.push_str(&format!(
@@ -370,11 +471,72 @@ mod sqlite_persistence {
             .map_err(|e| format!("unable to wait for sqlite3: {e}"))?;
         if !output.status.success() {
             return Err(format!(
-                "unable to save retained persistence: {}",
+                "unable to save persistence: {}",
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
         Ok(())
+    }
+
+    fn append_schema(sql: &mut String) {
+        sql.push_str("CREATE TABLE IF NOT EXISTS base_msgs (store_id INT64 PRIMARY KEY,expiry_time INT64,topic STRING NOT NULL,payload BLOB,source_id STRING,source_username STRING,payloadlen INTEGER,source_mid INTEGER,source_port INTEGER,qos INTEGER,retain INTEGER,properties STRING);\n");
+        sql.push_str(
+            "CREATE TABLE IF NOT EXISTS retains (topic STRING PRIMARY KEY,store_id INT64);\n",
+        );
+        sql.push_str("CREATE TABLE IF NOT EXISTS clients (client_id TEXT PRIMARY KEY,username TEXT,connection_time INT64,will_delay_time INT64,session_expiry_time INT64,listener_port INT,max_packet_size INT,max_qos INT,retain_available INT,session_expiry_interval INT,will_delay_interval INT);\n");
+        sql.push_str("CREATE TABLE IF NOT EXISTS subscriptions (client_id TEXT NOT NULL,topic TEXT NOT NULL,subscription_options INTEGER,subscription_identifier INTEGER,PRIMARY KEY (client_id, topic) );\n");
+        sql.push_str("CREATE TABLE IF NOT EXISTS client_msgs (client_id TEXT NOT NULL,cmsg_id INT64,store_id INT64,dup INTEGER,direction INTEGER,mid INTEGER,qos INTEGER,retain INTEGER,state INTEGER,subscription_identifier INTEGER);\n");
+    }
+
+    fn subscription_from_options(
+        filter: String,
+        options: u8,
+        identifier: Option<u32>,
+    ) -> Subscription {
+        Subscription {
+            filter,
+            qos: options & 0x03,
+            no_local: (options & 0x04) != 0,
+            retain_as_published: (options & 0x08) != 0,
+            retain_handling: (options & 0x30) >> 4,
+            identifier,
+            order: 0,
+        }
+    }
+
+    fn subscription_options(subscription: &Subscription) -> u8 {
+        let mut options = subscription.qos & 0x03;
+        if subscription.no_local {
+            options |= 0x04;
+        }
+        if subscription.retain_as_published {
+            options |= 0x08;
+        }
+        options | ((subscription.retain_handling & 0x03) << 4)
+    }
+
+    fn session_expiry_interval_from_db(value: &str) -> u32 {
+        match value.parse::<i64>() {
+            Ok(-1) => u32::MAX,
+            Ok(value) if value > 0 => u32::try_from(value).unwrap_or(u32::MAX),
+            _ => 0,
+        }
+    }
+
+    fn db_session_expiry_interval(value: u32) -> i64 {
+        if value == u32::MAX {
+            -1
+        } else {
+            i64::from(value)
+        }
+    }
+
+    fn session_expiry_time(value: u32) -> i64 {
+        if value == 0 || value == u32::MAX {
+            0
+        } else {
+            1
+        }
     }
 
     fn escape_sql(value: &str) -> String {
@@ -796,7 +958,7 @@ mod tests {
             retained_publication("b/topic", b"payload-b", 1),
             retained_publication("a/topic", b"payload-a", 0),
         ];
-        sqlite_persistence::save_retained(&db_path, &retained).expect("retained save should work");
+        sqlite_persistence::save(&db_path, &retained, &[]).expect("retained save should work");
 
         assert_eq!(
             sqlite_scalar(&db_path, "SELECT COUNT(*) FROM base_msgs;"),
@@ -830,6 +992,70 @@ mod tests {
         assert_eq!(loaded[1].payload, b"payload-b");
         assert_eq!(loaded[1].qos, 1);
         assert!(loaded[1].retain);
+
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(format!("{}-wal", db_path));
+        let _ = fs::remove_file(format!("{}-shm", db_path));
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn sqlite_persistence_round_trips_durable_sessions_and_subscriptions() {
+        let dir = env::temp_dir().join(format!("rusquitto-session-test-{}", unique_id()));
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let db = dir.join("mosquitto.sqlite3");
+        let db_path = db.to_string_lossy().to_string();
+
+        let sessions = vec![PersistedSession {
+            client_id: "persist-client".into(),
+            session_expiry_interval: u32::MAX,
+            subscriptions: vec![Subscription {
+                filter: "persist/#".into(),
+                qos: 1,
+                no_local: true,
+                retain_as_published: true,
+                retain_handling: 2,
+                identifier: Some(7),
+                order: 9,
+            }],
+        }];
+        sqlite_persistence::save(&db_path, &[], &sessions).expect("session save should work");
+
+        assert_eq!(
+            sqlite_scalar(&db_path, "SELECT COUNT(*) FROM clients;"),
+            "1"
+        );
+        assert_eq!(
+            sqlite_scalar(&db_path, "SELECT COUNT(*) FROM subscriptions;"),
+            "1"
+        );
+        assert_eq!(
+            sqlite_scalar(
+                &db_path,
+                "SELECT client_id || ':' || session_expiry_interval || ':' || session_expiry_time FROM clients;",
+            ),
+            "persist-client:-1:0"
+        );
+        assert_eq!(
+            sqlite_scalar(
+                &db_path,
+                "SELECT topic || ':' || subscription_options || ':' || subscription_identifier FROM subscriptions;",
+            ),
+            "persist/#:45:7"
+        );
+
+        let loaded = sqlite_persistence::load_sessions(&db_path).expect("session load should work");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].client_id, "persist-client");
+        assert_eq!(loaded[0].session_expiry_interval, u32::MAX);
+        assert_eq!(loaded[0].subscriptions.len(), 1);
+        let subscription = &loaded[0].subscriptions[0];
+        assert_eq!(subscription.filter, "persist/#");
+        assert_eq!(subscription.qos, 1);
+        assert!(subscription.no_local);
+        assert!(subscription.retain_as_published);
+        assert_eq!(subscription.retain_handling, 2);
+        assert_eq!(subscription.identifier, Some(7));
 
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(format!("{}-wal", db_path));
