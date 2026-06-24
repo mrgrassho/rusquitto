@@ -926,6 +926,8 @@ mod sqlite_persistence {
                 packet_id: None,
                 dup: false,
                 topic_alias: None,
+                response_topic: None,
+                correlation_data: None,
                 subscription_identifiers: Vec::new(),
             });
         }
@@ -1087,6 +1089,8 @@ mod sqlite_persistence {
                 packet_id,
                 dup,
                 topic_alias: None,
+                response_topic: None,
+                correlation_data: None,
                 subscription_identifiers: subscription_identifier.into_iter().collect(),
             };
             match (direction, state) {
@@ -1986,6 +1990,8 @@ mod tests {
             packet_id: None,
             dup: false,
             topic_alias: None,
+            response_topic: None,
+            correlation_data: None,
             subscription_identifiers: Vec::new(),
         }
     }
@@ -2005,6 +2011,8 @@ mod tests {
             packet_id: Some(packet_id),
             dup: false,
             topic_alias: None,
+            response_topic: None,
+            correlation_data: None,
             subscription_identifiers: subscription_identifier.into_iter().collect(),
         }
     }

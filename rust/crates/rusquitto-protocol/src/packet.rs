@@ -94,6 +94,8 @@ pub struct Publication {
     pub packet_id: Option<u16>,
     pub dup: bool,
     pub topic_alias: Option<u16>,
+    pub response_topic: Option<String>,
+    pub correlation_data: Option<Vec<u8>>,
     pub subscription_identifiers: Vec<u32>,
 }
 
@@ -327,6 +329,8 @@ fn decode_publish(
         packet_id,
         dup,
         topic_alias: publish_properties.topic_alias,
+        response_topic: publish_properties.response_topic,
+        correlation_data: publish_properties.correlation_data,
         subscription_identifiers: publish_properties.subscription_identifiers,
     }))
 }
@@ -561,6 +565,14 @@ pub fn encode_publish(protocol: ProtocolVersion, publication: &Publication) -> V
     }
     if protocol == ProtocolVersion::V5 {
         let mut properties = Vec::new();
+        if let Some(response_topic) = &publication.response_topic {
+            properties.push(PROP_RESPONSE_TOPIC as u8);
+            write_utf8(response_topic, &mut properties);
+        }
+        if let Some(correlation_data) = &publication.correlation_data {
+            properties.push(PROP_CORRELATION_DATA as u8);
+            write_binary(correlation_data, &mut properties);
+        }
         for identifier in &publication.subscription_identifiers {
             properties.push(PROP_SUBSCRIPTION_IDENTIFIER as u8);
             write_varint(*identifier, &mut properties);
@@ -639,6 +651,11 @@ fn write_utf8(value: &str, out: &mut Vec<u8>) {
     out.extend_from_slice(value.as_bytes());
 }
 
+fn write_binary(value: &[u8], out: &mut Vec<u8>) {
+    write_u16(value.len() as u16, out);
+    out.extend_from_slice(value);
+}
+
 struct Cursor<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -647,6 +664,8 @@ struct Cursor<'a> {
 #[derive(Debug, Default)]
 struct PublishProperties {
     topic_alias: Option<u16>,
+    response_topic: Option<String>,
+    correlation_data: Option<Vec<u8>>,
     subscription_identifiers: Vec<u32>,
 }
 
@@ -793,6 +812,12 @@ impl<'a> Cursor<'a> {
             match identifier {
                 PROP_TOPIC_ALIAS => {
                     properties.topic_alias = Some(self.read_u16()?);
+                }
+                PROP_RESPONSE_TOPIC => {
+                    properties.response_topic = Some(self.read_utf8()?);
+                }
+                PROP_CORRELATION_DATA => {
+                    properties.correlation_data = Some(self.read_binary()?);
                 }
                 PROP_SUBSCRIPTION_IDENTIFIER => {
                     let value = self.read_varint()?;
@@ -1087,6 +1112,8 @@ mod tests {
                 packet_id: Some(0x1234),
                 dup: true,
                 topic_alias: None,
+                response_topic: None,
+                correlation_data: None,
                 subscription_identifiers: Vec::new(),
             },
         );
@@ -1144,6 +1171,8 @@ mod tests {
                 packet_id: None,
                 dup: false,
                 topic_alias: None,
+                response_topic: None,
+                correlation_data: None,
                 subscription_identifiers: vec![321],
             },
         );
@@ -1163,6 +1192,50 @@ mod tests {
             encode_pubrel(ProtocolVersion::V5, 0x1234),
             vec![0x62, 2, 0x12, 0x34]
         );
+    }
+
+    #[test]
+    fn encodes_mqtt_v5_publish_response_properties() {
+        let encoded = encode_publish(
+            ProtocolVersion::V5,
+            &Publication {
+                topic: "normal/topic".into(),
+                payload: b"2".to_vec(),
+                qos: 0,
+                retain: false,
+                packet_id: None,
+                dup: false,
+                topic_alias: None,
+                response_topic: Some("response/topic".to_owned()),
+                correlation_data: Some(b"corr".to_vec()),
+                subscription_identifiers: Vec::new(),
+            },
+        );
+        assert!(encoded.windows(17).any(|window| {
+            window
+                == [
+                    PROP_RESPONSE_TOPIC as u8,
+                    0,
+                    14,
+                    b'r',
+                    b'e',
+                    b's',
+                    b'p',
+                    b'o',
+                    b'n',
+                    b's',
+                    b'e',
+                    b'/',
+                    b't',
+                    b'o',
+                    b'p',
+                    b'i',
+                    b'c',
+                ]
+        }));
+        assert!(encoded.windows(7).any(|window| {
+            window == [PROP_CORRELATION_DATA as u8, 0, 4, b'c', b'o', b'r', b'r']
+        }));
     }
 
     #[test]

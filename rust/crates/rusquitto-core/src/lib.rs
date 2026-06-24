@@ -369,6 +369,8 @@ impl BrokerState {
                 packet_id: None,
                 dup: false,
                 topic_alias: None,
+                response_topic: None,
+                correlation_data: None,
                 subscription_identifiers: Vec::new(),
             };
             let deliveries = self.publish(client_id, publication).deliveries;
@@ -836,6 +838,8 @@ mod tests {
             packet_id: None,
             dup: false,
             topic_alias: None,
+            response_topic: None,
+            correlation_data: None,
             subscription_identifiers: Vec::new(),
         }
     }
