@@ -25,6 +25,7 @@ const MQTT_RC_MALFORMED_PACKET: u8 = 0x81;
 const MQTT_RC_PROTOCOL_ERROR: u8 = 0x82;
 const MQTT_RC_NOT_AUTHORIZED: u8 = 0x87;
 const MQTT_RC_PACKET_TOO_LARGE: u8 = 0x95;
+const MQTT_RC_SESSION_TAKEN_OVER: u8 = 0x8E;
 const MQTT_RC_RETAIN_NOT_SUPPORTED: u8 = 0x9A;
 const UNKNOWN_SCHEMA_VERSION_PREFIX: &str = "Unknown database_schema version ";
 static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1511,6 +1512,7 @@ fn handle_client(
         stream.write_all(&encode_connack(protocol, false, rc))?;
         return Ok(());
     }
+    disconnect_replaced_client(&client_id, &outbound, &client_users);
     client_users
         .lock()
         .expect("client user lock poisoned")
@@ -1856,6 +1858,25 @@ fn resolve_topic_alias(
     } else {
         !publication.topic.is_empty()
     }
+}
+
+fn disconnect_replaced_client(client_id: &str, outbound: &OutboundMap, client_users: &ClientUsers) {
+    if let Some(previous) = outbound
+        .lock()
+        .expect("outbound lock poisoned")
+        .remove(client_id)
+    {
+        if previous.protocol == ProtocolVersion::V5 {
+            let _ = previous.sender.send(encode_disconnect(
+                previous.protocol,
+                MQTT_RC_SESSION_TAKEN_OVER,
+            ));
+        }
+    }
+    client_users
+        .lock()
+        .expect("client user lock poisoned")
+        .remove(client_id);
 }
 
 fn packet_exceeds_maximum(frame: &Frame, max_packet_size: Option<u32>) -> bool {
@@ -2342,6 +2363,35 @@ mod tests {
         assert_eq!(settings.max_packet_size, Some(50));
 
         let _ = fs::remove_file(config);
+    }
+
+    #[test]
+    fn disconnect_replaced_client_removes_live_user_mapping() {
+        let (tx, _rx) = mpsc::channel();
+        let outbound = Arc::new(Mutex::new(HashMap::from([(
+            "client".to_owned(),
+            ClientOutbound {
+                protocol: ProtocolVersion::V5,
+                mount_point: None,
+                maximum_packet_size: None,
+                sender: tx,
+            },
+        )])));
+        let users = Arc::new(Mutex::new(HashMap::from([(
+            "client".to_owned(),
+            Some("user".to_owned()),
+        )])));
+
+        disconnect_replaced_client("client", &outbound, &users);
+
+        assert!(!outbound
+            .lock()
+            .expect("outbound lock poisoned")
+            .contains_key("client"));
+        assert!(!users
+            .lock()
+            .expect("client user lock poisoned")
+            .contains_key("client"));
     }
 
     #[test]
