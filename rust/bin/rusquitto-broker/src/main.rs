@@ -58,7 +58,14 @@ struct Settings {
     retain_available: bool,
     upgrade_outgoing_qos: bool,
     persistence_db_file: Option<String>,
-    password_file: Option<HashMap<String, String>>,
+    password_file: Option<HashMap<String, PasswordEntry>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PasswordEntry {
+    Plain(String),
+    Sha512 { salt: Vec<u8>, hash: Vec<u8> },
+    Unsupported,
 }
 
 impl Default for Settings {
@@ -365,7 +372,7 @@ fn resolve_config_path(config_path: &str, value: &str) -> String {
         .unwrap_or_else(|| value.to_owned())
 }
 
-fn load_password_file(path: &str) -> Result<HashMap<String, String>, String> {
+fn load_password_file(path: &str) -> Result<HashMap<String, PasswordEntry>, String> {
     let contents = fs::read_to_string(path)
         .map_err(|e| format!("unable to read password_file {path}: {e}"))?;
     let mut entries = HashMap::new();
@@ -377,14 +384,79 @@ fn load_password_file(path: &str) -> Result<HashMap<String, String>, String> {
         let Some((username, password)) = line.split_once(':') else {
             return Err(format!("invalid password_file line for {path}"));
         };
-        entries.insert(username.to_owned(), password.to_owned());
+        entries.insert(
+            username.to_owned(),
+            parse_password_entry(password)
+                .map_err(|e| format!("invalid password_file line for {path}: {e}"))?,
+        );
     }
     Ok(entries)
 }
 
+fn parse_password_entry(value: &str) -> Result<PasswordEntry, String> {
+    if let Some(rest) = value.strip_prefix("$6$") {
+        let mut parts = rest.split('$');
+        let salt_b64 = parts
+            .next()
+            .ok_or_else(|| "missing sha512 salt".to_owned())?;
+        let hash_b64 = parts
+            .next()
+            .ok_or_else(|| "missing sha512 password hash".to_owned())?;
+        if parts.next().is_some() {
+            return Err("invalid sha512 password hash".to_owned());
+        }
+        let salt = decode_base64(salt_b64)?;
+        let hash = decode_base64(hash_b64)?;
+        if !(salt.len() == 12 || salt.len() == 64) {
+            return Err("invalid sha512 salt length".to_owned());
+        }
+        if hash.len() != 64 {
+            return Err("invalid sha512 hash length".to_owned());
+        }
+        Ok(PasswordEntry::Sha512 { salt, hash })
+    } else if value.starts_with('$') {
+        Ok(PasswordEntry::Unsupported)
+    } else {
+        Ok(PasswordEntry::Plain(value.to_owned()))
+    }
+}
+
+fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
+    let mut output = Vec::with_capacity(value.len() * 3 / 4);
+    let mut buffer = 0_u32;
+    let mut bits = 0_u8;
+    let mut padding = false;
+    for byte in value.bytes() {
+        let sextet = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => {
+                padding = true;
+                continue;
+            }
+            b'\r' | b'\n' => continue,
+            _ => return Err("invalid base64 character".to_owned()),
+        };
+        if padding {
+            return Err("invalid base64 padding".to_owned());
+        }
+        buffer = (buffer << 6) | u32::from(sextet);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push((buffer >> bits) as u8);
+            buffer &= (1_u32 << bits) - 1;
+        }
+    }
+    Ok(output)
+}
+
 fn connection_authorized(
     allow_anonymous: bool,
-    password_file: Option<&HashMap<String, String>>,
+    password_file: Option<&HashMap<String, PasswordEntry>>,
     username: Option<&str>,
     password: Option<&[u8]>,
 ) -> bool {
@@ -392,7 +464,7 @@ fn connection_authorized(
         return allow_anonymous;
     };
     let Some(password_file) = password_file else {
-        return true;
+        return allow_anonymous;
     };
     let Some(stored_password) = password_file.get(username) else {
         return false;
@@ -400,7 +472,53 @@ fn connection_authorized(
     let Some(password) = password else {
         return false;
     };
-    !stored_password.starts_with('$') && stored_password.as_bytes() == password
+    password_entry_matches(stored_password, password)
+}
+
+fn password_entry_matches(entry: &PasswordEntry, password: &[u8]) -> bool {
+    match entry {
+        PasswordEntry::Plain(stored_password) => stored_password.as_bytes() == password,
+        PasswordEntry::Sha512 { salt, hash } => sha512_password_matches(salt, hash, password),
+        PasswordEntry::Unsupported => false,
+    }
+}
+
+fn sha512_password_matches(salt: &[u8], expected_hash: &[u8], password: &[u8]) -> bool {
+    let mut child = match Command::new("openssl")
+        .arg("dgst")
+        .arg("-sha512")
+        .arg("-binary")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        return false;
+    };
+    if stdin.write_all(password).is_err() || stdin.write_all(salt).is_err() {
+        return false;
+    }
+    drop(stdin);
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(_) => return false,
+    };
+    output.status.success() && constant_time_eq(&output.stdout, expected_hash)
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0_u8;
+    for (left, right) in left.iter().zip(right) {
+        diff |= left ^ right;
+    }
+    diff == 0
 }
 
 mod sqlite_persistence {
@@ -1461,7 +1579,7 @@ mod tests {
                 .password_file
                 .as_ref()
                 .and_then(|entries| entries.get("user")),
-            Some(&"password".to_owned())
+            Some(&PasswordEntry::Plain("password".to_owned()))
         );
 
         let _ = fs::remove_file(&password_file);
@@ -1472,7 +1590,10 @@ mod tests {
     #[test]
     fn connection_authorization_uses_plaintext_password_file_entries() {
         let mut passwords = HashMap::new();
-        passwords.insert("user".to_owned(), "password".to_owned());
+        passwords.insert(
+            "user".to_owned(),
+            PasswordEntry::Plain("password".to_owned()),
+        );
 
         assert!(connection_authorized(
             false,
@@ -1500,6 +1621,41 @@ mod tests {
         ));
         assert!(connection_authorized(true, Some(&passwords), None, None));
         assert!(!connection_authorized(false, Some(&passwords), None, None));
+        assert!(connection_authorized(
+            true,
+            None,
+            Some("user"),
+            Some(b"password")
+        ));
+        assert!(!connection_authorized(
+            false,
+            None,
+            Some("user"),
+            Some(b"password")
+        ));
+    }
+
+    #[test]
+    fn connection_authorization_matches_mosquitto_sha512_password_entries() {
+        let mut passwords = HashMap::new();
+        passwords.insert(
+            "user".to_owned(),
+            parse_password_entry("$6$vZY4TS+/HBxHw38S$vvjVFECzb8dyuu/mruD2QKTfdFn0WmKxbc+1TsdB0L8EdHk3v9JRmfjHd56+VaTnUcSZOZ/hzkdvWCtxlX7AUQ==")
+                .expect("sha512 password entry should parse"),
+        );
+
+        assert!(connection_authorized(
+            false,
+            Some(&passwords),
+            Some("user"),
+            Some(b"password")
+        ));
+        assert!(!connection_authorized(
+            false,
+            Some(&passwords),
+            Some("user"),
+            Some(b"password9")
+        ));
     }
 
     #[test]
