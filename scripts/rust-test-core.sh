@@ -38,6 +38,7 @@ export BUILD_ROOT="$test_root"
     python3 03-publish-b2c-disconnect-qos2.py
     python3 03-publish-b2c-qos1-len.py
     python3 03-publish-b2c-qos2-len.py
+    python3 03-publish-qos1-max-inflight.py
     python3 03-publish-qos1-no-subscribers-v5.py
     python3 03-publish-qos1-retain-disabled.py
     python3 04-retain-clear-multiple.py

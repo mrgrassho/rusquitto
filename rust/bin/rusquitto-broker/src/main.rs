@@ -80,6 +80,7 @@ struct Settings {
     persistence_db_file: Option<String>,
     max_keepalive: Option<u16>,
     max_packet_size: Option<u32>,
+    max_inflight_messages: Option<u16>,
     password_file: Option<HashMap<String, PasswordEntry>>,
     acl_file: Option<AclFile>,
     acl_file_path: Option<String>,
@@ -144,6 +145,7 @@ impl Default for Settings {
             persistence_db_file: None,
             max_keepalive: None,
             max_packet_size: None,
+            max_inflight_messages: None,
             password_file: None,
             acl_file: None,
             acl_file_path: None,
@@ -483,6 +485,11 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
                         settings.max_packet_size = Some(value);
                     }
                 }
+                "max_inflight_messages" => {
+                    if let Some(value) = value.and_then(parse_receive_maximum) {
+                        settings.max_inflight_messages = Some(value);
+                    }
+                }
                 "password_file" => {
                     if let Some(value) = value {
                         password_file_path = Some(resolve_config_path(&path, value));
@@ -540,6 +547,11 @@ fn parse_bool(value: Option<&str>) -> Option<bool> {
 fn parse_maximum_qos(value: &str) -> Option<u8> {
     let value = value.parse::<u8>().ok()?;
     (value <= 2).then_some(value)
+}
+
+fn parse_receive_maximum(value: &str) -> Option<u16> {
+    let value = value.parse::<u16>().ok()?;
+    (value > 0).then_some(value)
 }
 
 fn parse_protocol_versions(value: &str) -> Option<Vec<ProtocolVersion>> {
@@ -1553,6 +1565,7 @@ fn handle_client(
             server_keep_alive,
             maximum_packet_size: settings.max_packet_size.unwrap_or(2_000_000),
             maximum_qos: settings.maximum_qos,
+            receive_maximum: settings.max_inflight_messages.unwrap_or(20),
         },
     ))?;
 
@@ -2417,6 +2430,25 @@ mod tests {
         assert_eq!(settings.max_packet_size, Some(50));
 
         let _ = fs::remove_file(config);
+    }
+
+    #[test]
+    fn parse_settings_reads_max_inflight_messages() {
+        let config = write_temp_config("listener 18890\nmax_inflight_messages 1\n");
+
+        let settings =
+            parse_settings(vec!["-c".to_owned(), config.clone()]).expect("settings should parse");
+
+        assert_eq!(settings.max_inflight_messages, Some(1));
+
+        let _ = fs::remove_file(config);
+    }
+
+    #[test]
+    fn parse_receive_maximum_rejects_zero() {
+        assert_eq!(parse_receive_maximum("1"), Some(1));
+        assert_eq!(parse_receive_maximum("0"), None);
+        assert_eq!(parse_receive_maximum("-1"), None);
     }
 
     #[test]
