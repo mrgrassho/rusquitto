@@ -33,6 +33,7 @@ export BUILD_ROOT="$test_root"
     python3 02-subpub-qos0-subscription-id.py
     python3 02-subpub-qos0-send-retain.py
     python3 02-subpub-qos0-topic-alias.py
+    python3 03-publish-bad-flags.py
     python3 03-publish-b2c-disconnect-qos2.py
     python3 03-publish-b2c-qos2-len.py
     python3 03-publish-qos1-no-subscribers-v5.py

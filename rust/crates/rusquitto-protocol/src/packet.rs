@@ -450,6 +450,7 @@ pub struct ConnackOptions<'a> {
     pub assigned_client_id: Option<&'a str>,
     pub server_keep_alive: Option<u16>,
     pub maximum_packet_size: u32,
+    pub maximum_qos: u8,
 }
 
 impl Default for ConnackOptions<'_> {
@@ -459,6 +460,7 @@ impl Default for ConnackOptions<'_> {
             assigned_client_id: None,
             server_keep_alive: None,
             maximum_packet_size: 2_000_000,
+            maximum_qos: 2,
         }
     }
 }
@@ -527,6 +529,10 @@ pub fn encode_connack_with_options(
             write_u32(options.maximum_packet_size, &mut properties);
             properties.push(PROP_RECEIVE_MAXIMUM as u8);
             write_u16(20, &mut properties);
+            if options.maximum_qos < 2 {
+                properties.push(PROP_MAXIMUM_QOS as u8);
+                properties.push(options.maximum_qos);
+            }
             write_varint(properties.len() as u32, &mut body);
             body.extend_from_slice(&properties);
         } else {
@@ -1015,6 +1021,22 @@ mod tests {
                 },
             ),
             vec![0x20, 14, 0, 0, 11, 0x22, 0, 10, 0x27, 0, 0, 0, 50, 0x21, 0, 20,]
+        );
+    }
+
+    #[test]
+    fn encodes_mqtt_v5_configured_maximum_qos() {
+        assert_eq!(
+            encode_connack_with_options(
+                ProtocolVersion::V5,
+                false,
+                0,
+                ConnackOptions {
+                    maximum_qos: 1,
+                    ..ConnackOptions::default()
+                },
+            ),
+            vec![0x20, 16, 0, 0, 13, 0x22, 0, 10, 0x27, 0, 0x1E, 0x84, 0x80, 0x21, 0, 20, 0x24, 1,]
         );
     }
 

@@ -28,6 +28,7 @@ const MQTT_RC_NOT_AUTHORIZED: u8 = 0x87;
 const MQTT_RC_PACKET_TOO_LARGE: u8 = 0x95;
 const MQTT_RC_SESSION_TAKEN_OVER: u8 = 0x8E;
 const MQTT_RC_RETAIN_NOT_SUPPORTED: u8 = 0x9A;
+const MQTT_RC_QOS_NOT_SUPPORTED: u8 = 0x9B;
 const UNKNOWN_SCHEMA_VERSION_PREFIX: &str = "Unknown database_schema version ";
 static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -72,6 +73,7 @@ struct Settings {
     listeners: Vec<ListenerSettings>,
     verbose: bool,
     retain_available: bool,
+    maximum_qos: u8,
     upgrade_outgoing_qos: bool,
     auto_id_prefix: Option<String>,
     accept_protocol_versions: Option<Vec<ProtocolVersion>>,
@@ -135,6 +137,7 @@ impl Default for Settings {
             }],
             verbose: false,
             retain_available: true,
+            maximum_qos: 2,
             upgrade_outgoing_qos: false,
             auto_id_prefix: None,
             accept_protocol_versions: None,
@@ -455,6 +458,11 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
                         settings.retain_available = value;
                     }
                 }
+                "maximum_qos" | "max_qos" => {
+                    if let Some(value) = value.and_then(parse_maximum_qos) {
+                        settings.maximum_qos = value;
+                    }
+                }
                 "upgrade_outgoing_qos" => {
                     if let Some(value) = parse_bool(value) {
                         settings.upgrade_outgoing_qos = value;
@@ -527,6 +535,11 @@ fn parse_bool(value: Option<&str>) -> Option<bool> {
         Some("false") | Some("0") => Some(false),
         _ => None,
     }
+}
+
+fn parse_maximum_qos(value: &str) -> Option<u8> {
+    let value = value.parse::<u8>().ok()?;
+    (value <= 2).then_some(value)
 }
 
 fn parse_protocol_versions(value: &str) -> Option<Vec<ProtocolVersion>> {
@@ -1539,6 +1552,7 @@ fn handle_client(
             assigned_client_id: assigned_client_id.as_deref(),
             server_keep_alive,
             maximum_packet_size: settings.max_packet_size.unwrap_or(2_000_000),
+            maximum_qos: settings.maximum_qos,
         },
     ))?;
 
@@ -1611,6 +1625,12 @@ fn handle_client(
 
         match packet {
             MqttPacket::Publish(mut publication) => {
+                if publication.qos > settings.maximum_qos {
+                    if protocol == ProtocolVersion::V5 {
+                        let _ = tx.send(encode_disconnect(protocol, MQTT_RC_QOS_NOT_SUPPORTED));
+                    }
+                    break;
+                }
                 if publication.retain && !settings.retain_available {
                     if protocol == ProtocolVersion::V5 {
                         let _ = tx.send(encode_disconnect(protocol, MQTT_RC_RETAIN_NOT_SUPPORTED));
@@ -2397,6 +2417,38 @@ mod tests {
         assert_eq!(settings.max_packet_size, Some(50));
 
         let _ = fs::remove_file(config);
+    }
+
+    #[test]
+    fn parse_settings_reads_maximum_qos() {
+        let config = write_temp_config("listener 18888\nmaximum_qos 1\n");
+
+        let settings =
+            parse_settings(vec!["-c".to_owned(), config.clone()]).expect("settings should parse");
+
+        assert_eq!(settings.maximum_qos, 1);
+
+        let _ = fs::remove_file(config);
+    }
+
+    #[test]
+    fn parse_settings_reads_legacy_max_qos_alias() {
+        let config = write_temp_config("listener 18889\nmax_qos 0\n");
+
+        let settings =
+            parse_settings(vec!["-c".to_owned(), config.clone()]).expect("settings should parse");
+
+        assert_eq!(settings.maximum_qos, 0);
+
+        let _ = fs::remove_file(config);
+    }
+
+    #[test]
+    fn parse_maximum_qos_rejects_out_of_range_values() {
+        assert_eq!(parse_maximum_qos("0"), Some(0));
+        assert_eq!(parse_maximum_qos("2"), Some(2));
+        assert_eq!(parse_maximum_qos("3"), None);
+        assert_eq!(parse_maximum_qos("-1"), None);
     }
 
     #[test]
