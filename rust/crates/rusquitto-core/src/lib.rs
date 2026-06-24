@@ -23,6 +23,7 @@ pub struct PersistedSession {
     pub queued: Vec<Publication>,
     pub inflight_qos1: Vec<Publication>,
     pub inflight_qos2: Vec<Qos2Outbound>,
+    pub inbound_qos2: Vec<Publication>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +164,15 @@ impl BrokerState {
                 inflight_qos2.insert(packet_id, outbound);
             }
 
+            let mut inbound_qos2 = BTreeMap::new();
+            for publication in session.inbound_qos2 {
+                let Some(publication) = Self::valid_inflight_publication(publication, 2) else {
+                    continue;
+                };
+                let packet_id = publication.packet_id.expect("validated packet id");
+                inbound_qos2.insert(packet_id, publication);
+            }
+
             self.clients.insert(
                 session.client_id.clone(),
                 ClientSession {
@@ -172,7 +182,7 @@ impl BrokerState {
                     queued,
                     inflight_qos1,
                     inflight_qos2,
-                    inbound_qos2: BTreeMap::new(),
+                    inbound_qos2,
                     session_expiry_interval: session.session_expiry_interval,
                     disconnected_at: None,
                     online: false,
@@ -224,6 +234,12 @@ impl BrokerState {
                     .filter(|outbound| Self::valid_publication(&outbound.publication))
                     .cloned()
                     .collect();
+                let inbound_qos2 = session
+                    .inbound_qos2
+                    .values()
+                    .filter(|publication| Self::valid_publication(publication))
+                    .cloned()
+                    .collect();
                 PersistedSession {
                     client_id: session.client_id.clone(),
                     session_expiry_interval: session.session_expiry_interval,
@@ -231,6 +247,7 @@ impl BrokerState {
                     queued,
                     inflight_qos1,
                     inflight_qos2,
+                    inbound_qos2,
                 }
             })
             .collect();
@@ -1438,6 +1455,7 @@ mod tests {
             queued: Vec::new(),
             inflight_qos1: Vec::new(),
             inflight_qos2: Vec::new(),
+            inbound_qos2: Vec::new(),
         }]);
 
         let mut queued = publication("persist/topic", false);
@@ -1581,6 +1599,47 @@ mod tests {
         let reconnect = restored.connect("sub".into(), false, None, 60);
         assert!(reconnect.queued.is_empty());
         assert_eq!(reconnect.pubrels, vec![packet_id]);
+    }
+
+    #[test]
+    fn snapshots_and_restores_inbound_qos2_for_persistence() {
+        let mut broker = BrokerState::new();
+        broker.connect("pub".into(), false, None, 60);
+
+        let mut inbound = publication("persist/inbound", false);
+        inbound.qos = 2;
+        inbound.packet_id = Some(17);
+        let result = broker.receive_qos2_publish("pub", inbound);
+        assert!(result.accepted);
+
+        let snapshot = broker.session_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].inbound_qos2.len(), 1);
+        assert_eq!(snapshot[0].inbound_qos2[0].packet_id, Some(17));
+
+        let mut restored = BrokerState::new();
+        restored.restore_sessions(snapshot);
+        restored.connect("sub".into(), true, None, 0);
+        restored.subscribe(
+            "sub",
+            vec![SubscriptionRequest {
+                filter: "persist/inbound".into(),
+                qos: 2,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+                identifier: None,
+            }],
+        );
+
+        let reconnect = restored.connect("pub".into(), false, None, 60);
+        assert!(reconnect.session_present);
+        let result = restored.pubrel("pub", 17).expect("pubrel should release");
+        assert!(result.accepted);
+        assert_eq!(result.deliveries.len(), 1);
+        assert_eq!(result.deliveries[0].client_id, "sub");
+        assert_eq!(result.deliveries[0].publication.topic, "persist/inbound");
+        assert_eq!(result.deliveries[0].publication.payload, b"payload");
     }
 
     #[test]
