@@ -67,6 +67,7 @@ pub struct BrokerState {
     clients: HashMap<String, ClientSession>,
     retained: BTreeMap<String, Publication>,
     shared_cursors: HashMap<(String, String), usize>,
+    upgrade_outgoing_qos: bool,
     next_outgoing_mid: u16,
     next_subscription_order: u64,
 }
@@ -78,6 +79,10 @@ impl BrokerState {
             next_subscription_order: 1,
             ..Self::default()
         }
+    }
+
+    pub fn set_upgrade_outgoing_qos(&mut self, value: bool) {
+        self.upgrade_outgoing_qos = value;
     }
 
     pub fn connect(
@@ -294,7 +299,7 @@ impl BrokerState {
 
             for publication in matching {
                 let mut retained_publication = publication.clone();
-                retained_publication.qos = retained_publication.qos.min(subscription.qos);
+                retained_publication.qos = self.delivery_qos(publication.qos, subscription.qos);
                 retained_publication.retain =
                     !subscription.retain_as_published || publication.retain;
                 retained_publication.subscription_identifiers.clear();
@@ -449,7 +454,7 @@ impl BrokerState {
                 }
                 let spec = DeliverySpec {
                     client_id: client_id.clone(),
-                    qos: subscription.qos.min(publication.qos),
+                    qos: self.delivery_qos(publication.qos, subscription.qos),
                     retain_as_published: subscription.retain_as_published,
                     identifier: subscription.identifier,
                     online: session.online,
@@ -512,6 +517,14 @@ impl BrokerState {
 
     fn valid_publication(publication: &Publication) -> bool {
         topic::check_publish_topic(&publication.topic).is_ok() && publication.qos <= 2
+    }
+
+    fn delivery_qos(&self, publish_qos: u8, subscription_qos: u8) -> u8 {
+        if self.upgrade_outgoing_qos {
+            subscription_qos
+        } else {
+            publish_qos.min(subscription_qos)
+        }
     }
 
     fn track_outgoing(&mut self, client_id: &str, publication: &Publication) {
@@ -831,6 +844,32 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["1", "1/2/3/4/5/6/7"]
         );
+    }
+
+    #[test]
+    fn can_upgrade_retained_replay_qos_to_subscription_qos() {
+        let mut broker = BrokerState::new();
+        broker.set_upgrade_outgoing_qos(true);
+        broker.connect("pub".into(), true, None, 0);
+        broker.publish("pub", publication("retain/upgrade", true));
+        broker.connect("sub".into(), true, None, 0);
+
+        let result = broker.subscribe(
+            "sub",
+            vec![SubscriptionRequest {
+                filter: "retain/upgrade".into(),
+                qos: 1,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+                identifier: None,
+            }],
+        );
+
+        assert_eq!(result.retained.len(), 1);
+        assert_eq!(result.retained[0].publication.qos, 1);
+        assert_eq!(result.retained[0].publication.packet_id, Some(1));
+        assert!(broker.has_inflight_qos1("sub", 1));
     }
 
     #[test]

@@ -428,16 +428,31 @@ pub fn encode_connack(
     session_present: bool,
     reason_code: u8,
 ) -> Vec<u8> {
+    encode_connack_with_retain_available(protocol, session_present, reason_code, true)
+}
+
+pub fn encode_connack_with_retain_available(
+    protocol: ProtocolVersion,
+    session_present: bool,
+    reason_code: u8,
+    retain_available: bool,
+) -> Vec<u8> {
     let mut body = vec![u8::from(session_present), reason_code];
     if protocol == ProtocolVersion::V5 {
         if reason_code == 0 {
-            body.push(11);
-            body.push(PROP_TOPIC_ALIAS_MAXIMUM as u8);
-            write_u16(10, &mut body);
-            body.push(PROP_MAXIMUM_PACKET_SIZE as u8);
-            write_u32(2_000_000, &mut body);
-            body.push(PROP_RECEIVE_MAXIMUM as u8);
-            write_u16(20, &mut body);
+            let mut properties = Vec::new();
+            properties.push(PROP_TOPIC_ALIAS_MAXIMUM as u8);
+            write_u16(10, &mut properties);
+            if !retain_available {
+                properties.push(PROP_RETAIN_AVAILABLE as u8);
+                properties.push(0);
+            }
+            properties.push(PROP_MAXIMUM_PACKET_SIZE as u8);
+            write_u32(2_000_000, &mut properties);
+            properties.push(PROP_RECEIVE_MAXIMUM as u8);
+            write_u16(20, &mut properties);
+            write_varint(properties.len() as u32, &mut body);
+            body.extend_from_slice(&properties);
         } else {
             body.push(0);
         }
@@ -800,6 +815,14 @@ mod tests {
         assert_eq!(
             encode_connack(ProtocolVersion::V5, false, 0),
             vec![0x20, 14, 0, 0, 11, 0x22, 0, 10, 0x27, 0, 0x1E, 0x84, 0x80, 0x21, 0, 20,]
+        );
+    }
+
+    #[test]
+    fn encodes_mqtt_v5_connack_retain_unavailable() {
+        assert_eq!(
+            encode_connack_with_retain_available(ProtocolVersion::V5, false, 0, false),
+            vec![0x20, 16, 0, 0, 13, 0x22, 0, 10, 0x25, 0, 0x27, 0, 0x1E, 0x84, 0x80, 0x21, 0, 20,]
         );
     }
 
