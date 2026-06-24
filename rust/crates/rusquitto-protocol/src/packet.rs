@@ -437,12 +437,48 @@ pub fn encode_connack_with_retain_available(
     reason_code: u8,
     retain_available: bool,
 ) -> Vec<u8> {
+    encode_connack_with_properties(
+        protocol,
+        session_present,
+        reason_code,
+        retain_available,
+        None,
+    )
+}
+
+pub fn encode_connack_with_assigned_client_id(
+    protocol: ProtocolVersion,
+    session_present: bool,
+    reason_code: u8,
+    retain_available: bool,
+    assigned_client_id: Option<&str>,
+) -> Vec<u8> {
+    encode_connack_with_properties(
+        protocol,
+        session_present,
+        reason_code,
+        retain_available,
+        assigned_client_id,
+    )
+}
+
+fn encode_connack_with_properties(
+    protocol: ProtocolVersion,
+    session_present: bool,
+    reason_code: u8,
+    retain_available: bool,
+    assigned_client_id: Option<&str>,
+) -> Vec<u8> {
     let mut body = vec![u8::from(session_present), reason_code];
     if protocol == ProtocolVersion::V5 {
         if reason_code == 0 {
             let mut properties = Vec::new();
             properties.push(PROP_TOPIC_ALIAS_MAXIMUM as u8);
             write_u16(10, &mut properties);
+            if let Some(client_id) = assigned_client_id {
+                properties.push(PROP_ASSIGNED_CLIENT_IDENTIFIER as u8);
+                write_utf8(client_id, &mut properties);
+            }
             if !retain_available {
                 properties.push(PROP_RETAIN_AVAILABLE as u8);
                 properties.push(0);
@@ -823,6 +859,23 @@ mod tests {
         assert_eq!(
             encode_connack_with_retain_available(ProtocolVersion::V5, false, 0, false),
             vec![0x20, 16, 0, 0, 13, 0x22, 0, 10, 0x25, 0, 0x27, 0, 0x1E, 0x84, 0x80, 0x21, 0, 20,]
+        );
+    }
+
+    #[test]
+    fn encodes_mqtt_v5_assigned_client_identifier() {
+        assert_eq!(
+            encode_connack_with_assigned_client_id(
+                ProtocolVersion::V5,
+                false,
+                0,
+                true,
+                Some("auto-test"),
+            ),
+            vec![
+                0x20, 26, 0, 0, 23, 0x22, 0, 10, 0x12, 0, 9, b'a', b'u', b't', b'o', b'-', b't',
+                b'e', b's', b't', 0x27, 0, 0x1E, 0x84, 0x80, 0x21, 0, 20,
+            ]
         );
     }
 

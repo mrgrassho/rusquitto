@@ -15,7 +15,7 @@ use rusquitto_core::{
     BrokerState, PersistedSession, Qos2Outbound, Qos2OutboundState, Subscription,
 };
 use rusquitto_protocol::{
-    decode_frame, encode_connack, encode_connack_with_retain_available, encode_disconnect,
+    decode_frame, encode_connack, encode_connack_with_assigned_client_id, encode_disconnect,
     encode_pingresp, encode_puback, encode_pubcomp, encode_publish, encode_pubrec, encode_pubrel,
     encode_suback, encode_unsuback, read_frame, topic, MqttPacket, ProtocolVersion, Publication,
 };
@@ -1352,9 +1352,12 @@ fn handle_client(
         mut will,
         session_expiry_interval,
     ) = connect;
-    if client_id.is_empty() {
-        client_id = format!("auto-{}", unique_id());
-    }
+    let assigned_client_id = if client_id.is_empty() {
+        client_id = auto_client_id();
+        Some(client_id.clone())
+    } else {
+        None
+    };
     if let Some(will) = will.as_mut() {
         apply_mount_point_to_topic(&mut will.topic, mount_point.as_deref());
     }
@@ -1385,11 +1388,12 @@ fn handle_client(
         will,
         broker_session_expiry_interval,
     );
-    stream.write_all(&encode_connack_with_retain_available(
+    stream.write_all(&encode_connack_with_assigned_client_id(
         protocol,
         connect_result.session_present,
         0,
         settings.retain_available,
+        assigned_client_id.as_deref(),
     ))?;
 
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
@@ -1788,6 +1792,18 @@ fn send_deliveries(
     }
 }
 
+fn auto_client_id() -> String {
+    let hex = format!("{:032x}", unique_id());
+    format!(
+        "auto-{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
 fn unique_id() -> u128 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
@@ -1872,6 +1888,17 @@ mod tests {
         let path = env::temp_dir().join(format!("rusquitto-config-test-{}.conf", unique_id()));
         fs::write(&path, contents).expect("temp config should be written");
         path.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn auto_client_id_uses_mosquitto_uuid_shape() {
+        let client_id = auto_client_id();
+        assert_eq!(client_id.len(), 41);
+        assert!(client_id.starts_with("auto-"));
+        assert_eq!(client_id.as_bytes()[13], b'-');
+        assert_eq!(client_id.as_bytes()[18], b'-');
+        assert_eq!(client_id.as_bytes()[23], b'-');
+        assert_eq!(client_id.as_bytes()[28], b'-');
     }
 
     #[test]
