@@ -35,4 +35,5 @@ export BUILD_ROOT="$test_root"
     python3 04-retain-qos0-repeated.py
     python3 04-retain-upgrade-outgoing-qos.py
     python3 07-will-qos0.py
+    python3 09-acl-empty-file.py
 )

@@ -16,7 +16,7 @@ use rusquitto_core::{
 use rusquitto_protocol::{
     decode_frame, encode_connack, encode_connack_with_retain_available, encode_disconnect,
     encode_pingresp, encode_puback, encode_pubcomp, encode_publish, encode_pubrec, encode_pubrel,
-    encode_suback, encode_unsuback, read_frame, MqttPacket, ProtocolVersion, Publication,
+    encode_suback, encode_unsuback, read_frame, topic, MqttPacket, ProtocolVersion, Publication,
 };
 
 const MQTT_RC_MALFORMED_PACKET: u8 = 0x81;
@@ -26,6 +26,7 @@ const MQTT_RC_RETAIN_NOT_SUPPORTED: u8 = 0x9A;
 const UNKNOWN_SCHEMA_VERSION_PREFIX: &str = "Unknown database_schema version ";
 
 type OutboundMap = Arc<Mutex<HashMap<String, ClientOutbound>>>;
+type ClientUsers = Arc<Mutex<HashMap<String, Option<String>>>>;
 type SharedBroker = Arc<Mutex<BrokerState>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +60,7 @@ struct Settings {
     upgrade_outgoing_qos: bool,
     persistence_db_file: Option<String>,
     password_file: Option<HashMap<String, PasswordEntry>>,
+    acl_file: Option<AclFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +68,39 @@ enum PasswordEntry {
     Plain(String),
     Sha512 { salt: Vec<u8>, hash: Vec<u8> },
     Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AclFile {
+    rules: Vec<AclRule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AclRule {
+    scope: AclScope,
+    access: AclAccess,
+    filter: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AclScope {
+    Anonymous,
+    User(String),
+    Pattern,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AclAccess {
+    Read,
+    Write,
+    ReadWrite,
+    Deny,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AclOperation {
+    Read,
+    Write,
 }
 
 impl Default for Settings {
@@ -80,6 +115,7 @@ impl Default for Settings {
             upgrade_outgoing_qos: false,
             persistence_db_file: None,
             password_file: None,
+            acl_file: None,
         }
     }
 }
@@ -131,6 +167,7 @@ fn run() -> Result<(), String> {
     }
     let broker = Arc::new(Mutex::new(broker_state));
     let outbound = Arc::new(Mutex::new(HashMap::new()));
+    let client_users = Arc::new(Mutex::new(HashMap::new()));
     while !shutdown::requested() {
         let mut accepted = false;
         for listener in &listeners {
@@ -143,12 +180,18 @@ fn run() -> Result<(), String> {
                     }
                     let broker = Arc::clone(&broker);
                     let outbound = Arc::clone(&outbound);
+                    let client_users = Arc::clone(&client_users);
                     let settings = settings.clone();
                     let allow_anonymous = listener.settings.allow_anonymous;
                     thread::spawn(move || {
-                        if let Err(err) =
-                            handle_client(stream, broker, outbound, settings, allow_anonymous)
-                        {
+                        if let Err(err) = handle_client(
+                            stream,
+                            broker,
+                            outbound,
+                            client_users,
+                            settings,
+                            allow_anonymous,
+                        ) {
                             eprintln!("Client error: {err}");
                         }
                     });
@@ -259,6 +302,7 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
     let mut listener_drafts = Vec::new();
     let mut default_listener_allow = None;
     let mut password_file_path = None;
+    let mut acl_file_path = None;
     if let Some(path) = config_path {
         let contents =
             fs::read_to_string(&path).map_err(|e| format!("unable to read config {path}: {e}"))?;
@@ -326,6 +370,11 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
                         password_file_path = Some(resolve_config_path(&path, value));
                     }
                 }
+                "acl_file" => {
+                    if let Some(value) = value {
+                        acl_file_path = Some(resolve_config_path(&path, value));
+                    }
+                }
                 _ => {}
             }
         }
@@ -347,6 +396,9 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
         .collect();
     if let Some(path) = password_file_path {
         settings.password_file = Some(load_password_file(&path)?);
+    }
+    if let Some(path) = acl_file_path {
+        settings.acl_file = Some(load_acl_file(&path)?);
     }
 
     Ok(settings)
@@ -519,6 +571,122 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         diff |= left ^ right;
     }
     diff == 0
+}
+
+fn load_acl_file(path: &str) -> Result<AclFile, String> {
+    let contents =
+        fs::read_to_string(path).map_err(|e| format!("unable to read acl_file {path}: {e}"))?;
+    let mut rules = Vec::new();
+    let mut current_user = None;
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        match parts.next() {
+            Some("user") => {
+                current_user = parts.next().map(str::to_owned);
+            }
+            Some("topic") => {
+                let Some((access, filter)) = parse_acl_access_and_filter(parts.collect()) else {
+                    return Err(format!("invalid acl_file line for {path}: {line}"));
+                };
+                rules.push(AclRule {
+                    scope: current_user
+                        .as_ref()
+                        .map_or(AclScope::Anonymous, |user| AclScope::User(user.clone())),
+                    access,
+                    filter,
+                });
+            }
+            Some("pattern") => {
+                let Some((access, filter)) = parse_acl_access_and_filter(parts.collect()) else {
+                    return Err(format!("invalid acl_file line for {path}: {line}"));
+                };
+                rules.push(AclRule {
+                    scope: AclScope::Pattern,
+                    access,
+                    filter,
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(AclFile { rules })
+}
+
+fn parse_acl_access_and_filter(parts: Vec<&str>) -> Option<(AclAccess, String)> {
+    match parts.as_slice() {
+        [filter] => Some((AclAccess::ReadWrite, (*filter).to_owned())),
+        [access, filter] => parse_acl_access(access).map(|access| (access, (*filter).to_owned())),
+        _ => None,
+    }
+}
+
+fn parse_acl_access(value: &str) -> Option<AclAccess> {
+    match value {
+        "read" => Some(AclAccess::Read),
+        "write" => Some(AclAccess::Write),
+        "readwrite" => Some(AclAccess::ReadWrite),
+        "deny" => Some(AclAccess::Deny),
+        _ => None,
+    }
+}
+
+fn acl_allows(
+    settings: &Settings,
+    username: Option<&str>,
+    client_id: &str,
+    operation: AclOperation,
+    topic_name: &str,
+) -> bool {
+    let Some(acl_file) = settings.acl_file.as_ref() else {
+        return true;
+    };
+    let mut allowed = false;
+    for rule in &acl_file.rules {
+        if !acl_rule_applies(rule, username, client_id, topic_name) {
+            continue;
+        }
+        if rule.access == AclAccess::Deny {
+            return false;
+        }
+        if acl_access_allows(rule.access, operation) {
+            allowed = true;
+        }
+    }
+    allowed
+}
+
+fn acl_rule_applies(
+    rule: &AclRule,
+    username: Option<&str>,
+    client_id: &str,
+    topic_name: &str,
+) -> bool {
+    match &rule.scope {
+        AclScope::Anonymous => username.is_none() && topic::matches(&rule.filter, topic_name),
+        AclScope::User(rule_user) => {
+            username == Some(rule_user.as_str()) && topic::matches(&rule.filter, topic_name)
+        }
+        AclScope::Pattern => {
+            let Some(username) = username else {
+                return false;
+            };
+            let filter = rule.filter.replace("%u", username).replace("%c", client_id);
+            topic::matches(&filter, topic_name)
+        }
+    }
+}
+
+fn acl_access_allows(access: AclAccess, operation: AclOperation) -> bool {
+    matches!(
+        (access, operation),
+        (AclAccess::ReadWrite, _)
+            | (AclAccess::Read, AclOperation::Read)
+            | (AclAccess::Write, AclOperation::Write)
+    )
 }
 
 mod sqlite_persistence {
@@ -1078,6 +1246,7 @@ fn handle_client(
     mut stream: TcpStream,
     broker: SharedBroker,
     outbound: OutboundMap,
+    client_users: ClientUsers,
     settings: Settings,
     allow_anonymous: bool,
 ) -> io::Result<()> {
@@ -1126,6 +1295,10 @@ fn handle_client(
         stream.write_all(&encode_connack(protocol, false, rc))?;
         return Ok(());
     }
+    client_users
+        .lock()
+        .expect("client user lock poisoned")
+        .insert(client_id.clone(), username.clone());
 
     let broker_session_expiry_interval =
         broker_session_expiry_interval(protocol, clean_start, session_expiry_interval);
@@ -1193,6 +1366,28 @@ fn handle_client(
                     }
                     break;
                 }
+                if !acl_allows(
+                    &settings,
+                    username.as_deref(),
+                    &client_id,
+                    AclOperation::Write,
+                    &publication.topic,
+                ) {
+                    match publication.qos {
+                        1 => {
+                            if let Some(packet_id) = publication.packet_id {
+                                let _ = tx.send(encode_puback(protocol, packet_id));
+                            }
+                        }
+                        2 => {
+                            if let Some(packet_id) = publication.packet_id {
+                                let _ = tx.send(encode_pubrec(protocol, packet_id));
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
 
                 match publication.qos {
                     1 => {
@@ -1208,7 +1403,7 @@ fn handle_client(
                             }
                             break;
                         }
-                        send_deliveries(protocol, &outbound, result.deliveries);
+                        send_deliveries(&settings, &client_users, &outbound, result.deliveries);
                         if let Some(packet_id) = packet_id {
                             let _ = tx.send(encode_puback(protocol, packet_id));
                         }
@@ -1246,7 +1441,7 @@ fn handle_client(
                             }
                             break;
                         }
-                        send_deliveries(protocol, &outbound, result.deliveries);
+                        send_deliveries(&settings, &client_users, &outbound, result.deliveries);
                     }
                 }
             }
@@ -1262,7 +1457,7 @@ fn handle_client(
                         }
                         break;
                     }
-                    send_deliveries(protocol, &outbound, result.deliveries);
+                    send_deliveries(&settings, &client_users, &outbound, result.deliveries);
                 }
                 let _ = tx.send(encode_pubcomp(protocol, packet_id));
             }
@@ -1329,7 +1524,7 @@ fn handle_client(
                     break;
                 }
                 let _ = tx.send(encode_suback(protocol, packet_id, &result.reason_codes));
-                send_deliveries(protocol, &outbound, result.retained);
+                send_deliveries(&settings, &client_users, &outbound, result.retained);
             }
             MqttPacket::Unsubscribe { packet_id, filters } => {
                 broker
@@ -1350,10 +1545,14 @@ fn handle_client(
                     true,
                     session_expiry_interval,
                 );
-                send_deliveries(protocol, &outbound, deliveries);
+                send_deliveries(&settings, &client_users, &outbound, deliveries);
                 outbound
                     .lock()
                     .expect("outbound lock poisoned")
+                    .remove(&client_id);
+                client_users
+                    .lock()
+                    .expect("client user lock poisoned")
                     .remove(&client_id);
                 return Ok(());
             }
@@ -1365,11 +1564,15 @@ fn handle_client(
         .lock()
         .expect("outbound lock poisoned")
         .remove(&client_id);
+    client_users
+        .lock()
+        .expect("client user lock poisoned")
+        .remove(&client_id);
     let deliveries = broker
         .lock()
         .expect("broker lock poisoned")
         .disconnect(&client_id, false, None);
-    send_deliveries(protocol, &outbound, deliveries);
+    send_deliveries(&settings, &client_users, &outbound, deliveries);
     Ok(())
 }
 
@@ -1393,12 +1596,26 @@ fn resolve_topic_alias(
 }
 
 fn send_deliveries(
-    _source_protocol: ProtocolVersion,
+    settings: &Settings,
+    client_users: &ClientUsers,
     outbound: &OutboundMap,
     deliveries: Vec<rusquitto_core::Delivery>,
 ) {
     let map = outbound.lock().expect("outbound lock poisoned");
+    let users = client_users.lock().expect("client user lock poisoned");
     for delivery in deliveries {
+        let username = users
+            .get(&delivery.client_id)
+            .and_then(|username| username.as_deref());
+        if !acl_allows(
+            settings,
+            username,
+            &delivery.client_id,
+            AclOperation::Read,
+            &delivery.publication.topic,
+        ) {
+            continue;
+        }
         if let Some(client) = map.get(&delivery.client_id) {
             let _ = client
                 .sender
@@ -1656,6 +1873,122 @@ mod tests {
             Some("user"),
             Some(b"password9")
         ));
+    }
+
+    #[test]
+    fn acl_file_matches_anonymous_user_and_pattern_rules() {
+        let settings = Settings {
+            acl_file: Some(AclFile {
+                rules: vec![
+                    AclRule {
+                        scope: AclScope::Anonymous,
+                        access: AclAccess::ReadWrite,
+                        filter: "topic/global/#".to_owned(),
+                    },
+                    AclRule {
+                        scope: AclScope::Anonymous,
+                        access: AclAccess::Deny,
+                        filter: "topic/global/except".to_owned(),
+                    },
+                    AclRule {
+                        scope: AclScope::User("username".to_owned()),
+                        access: AclAccess::ReadWrite,
+                        filter: "topic/username/#".to_owned(),
+                    },
+                    AclRule {
+                        scope: AclScope::User("username".to_owned()),
+                        access: AclAccess::Deny,
+                        filter: "topic/username/except".to_owned(),
+                    },
+                    AclRule {
+                        scope: AclScope::Pattern,
+                        access: AclAccess::ReadWrite,
+                        filter: "pattern/%u/#".to_owned(),
+                    },
+                    AclRule {
+                        scope: AclScope::Pattern,
+                        access: AclAccess::Deny,
+                        filter: "pattern/%u/except".to_owned(),
+                    },
+                ],
+            }),
+            ..Settings::default()
+        };
+
+        assert!(acl_allows(
+            &settings,
+            None,
+            "client",
+            AclOperation::Write,
+            "topic/global"
+        ));
+        assert!(!acl_allows(
+            &settings,
+            Some("username"),
+            "client",
+            AclOperation::Write,
+            "topic/global"
+        ));
+        assert!(!acl_allows(
+            &settings,
+            None,
+            "client",
+            AclOperation::Read,
+            "topic/global/except"
+        ));
+        assert!(acl_allows(
+            &settings,
+            Some("username"),
+            "client",
+            AclOperation::Read,
+            "topic/username/value"
+        ));
+        assert!(!acl_allows(
+            &settings,
+            Some("username"),
+            "client",
+            AclOperation::Read,
+            "topic/username/except"
+        ));
+        assert!(acl_allows(
+            &settings,
+            Some("username"),
+            "client",
+            AclOperation::Write,
+            "pattern/username/value"
+        ));
+        assert!(!acl_allows(
+            &settings,
+            Some("username"),
+            "client",
+            AclOperation::Write,
+            "pattern/username/except"
+        ));
+        assert!(!acl_allows(
+            &settings,
+            None,
+            "client",
+            AclOperation::Write,
+            "pattern/username/value"
+        ));
+    }
+
+    #[test]
+    fn acl_file_loader_preserves_topic_wildcards() {
+        let path = env::temp_dir().join(format!("rusquitto-acl-test-{}.acl", unique_id()));
+        fs::write(
+            &path,
+            "# comment\ntopic readwrite topic/global/#\npattern readwrite pattern/%u/#\n",
+        )
+        .expect("acl file should be written");
+
+        let acl = load_acl_file(&path.to_string_lossy()).expect("acl should load");
+
+        assert_eq!(acl.rules.len(), 2);
+        assert_eq!(acl.rules[0].filter, "topic/global/#");
+        assert_eq!(acl.rules[1].filter, "pattern/%u/#");
+
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
