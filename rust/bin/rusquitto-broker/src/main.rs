@@ -23,6 +23,7 @@ const MQTT_RC_MALFORMED_PACKET: u8 = 0x81;
 const MQTT_RC_PROTOCOL_ERROR: u8 = 0x82;
 const MQTT_RC_NOT_AUTHORIZED: u8 = 0x87;
 const MQTT_RC_RETAIN_NOT_SUPPORTED: u8 = 0x9A;
+const UNKNOWN_SCHEMA_VERSION_PREFIX: &str = "Unknown database_schema version ";
 
 type OutboundMap = Arc<Mutex<HashMap<String, ClientOutbound>>>;
 type SharedBroker = Arc<Mutex<BrokerState>>;
@@ -59,7 +60,15 @@ impl Default for Settings {
 fn main() {
     if let Err(err) = run() {
         eprintln!("Error: {err}");
-        std::process::exit(1);
+        std::process::exit(exit_code_for_error(&err));
+    }
+}
+
+fn exit_code_for_error(err: &str) -> i32 {
+    if err.starts_with(UNKNOWN_SCHEMA_VERSION_PREFIX) {
+        3
+    } else {
+        1
     }
 }
 
@@ -77,6 +86,7 @@ fn run() -> Result<(), String> {
     let mut broker_state = BrokerState::new();
     broker_state.set_upgrade_outgoing_qos(settings.upgrade_outgoing_qos);
     if let Some(path) = settings.persistence_db_file.as_deref() {
+        sqlite_persistence::validate_schema_version(path)?;
         let retained = sqlite_persistence::load_retained(path)?;
         broker_state.restore_retained(retained);
         let sessions = sqlite_persistence::load_sessions(path)?;
@@ -265,6 +275,49 @@ fn parse_bool(value: Option<&str>) -> Option<bool> {
 
 mod sqlite_persistence {
     use super::*;
+
+    pub fn validate_schema_version(path: &str) -> Result<(), String> {
+        if !Path::new(path).exists() {
+            return Ok(());
+        }
+
+        let has_version_info = sqlite_scalar(
+            path,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='version_info';",
+            "inspect persistence schema",
+        )?;
+        if has_version_info.trim() == "0" {
+            return Ok(());
+        }
+
+        let version = sqlite_scalar(
+            path,
+            "SELECT major || '.' || minor || '.' || patch FROM version_info WHERE component='database_schema' LIMIT 1;",
+            "inspect persistence schema",
+        )?;
+        let version = version.trim();
+        if version.is_empty() || version.starts_with("1.0.") || version.starts_with("1.1.") {
+            Ok(())
+        } else {
+            Err(format!("{UNKNOWN_SCHEMA_VERSION_PREFIX}{version}"))
+        }
+    }
+
+    fn sqlite_scalar(path: &str, sql: &str, context: &str) -> Result<String, String> {
+        let output = Command::new("sqlite3")
+            .arg("-batch")
+            .arg(path)
+            .arg(sql)
+            .output()
+            .map_err(|e| format!("unable to run sqlite3: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "unable to {context}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
 
     pub fn load_retained(path: &str) -> Result<Vec<Publication>, String> {
         if !Path::new(path).exists() {
@@ -498,6 +551,7 @@ mod sqlite_persistence {
                     .map_err(|e| format!("unable to create persistence directory: {e}"))?;
             }
         }
+        validate_schema_version(path)?;
 
         let mut sql = String::new();
         sql.push_str("PRAGMA page_size=4096;\n");
@@ -1170,6 +1224,40 @@ mod tests {
             "sqlite3 failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn maps_unknown_schema_version_to_migration_failure_exit_code() {
+        assert_eq!(
+            exit_code_for_error("Unknown database_schema version 1.2.0"),
+            3
+        );
+        assert_eq!(exit_code_for_error("other startup failure"), 1);
+    }
+
+    #[test]
+    fn sqlite_persistence_rejects_unknown_schema_versions() {
+        let dir = env::temp_dir().join(format!("rusquitto-version-reject-test-{}", unique_id()));
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let db = dir.join("mosquitto.sqlite3");
+        let db_path = db.to_string_lossy().to_string();
+
+        sqlite_exec(
+            &db_path,
+            "CREATE TABLE version_info(component TEXT NOT NULL,major INTEGER NOT NULL,minor INTEGER NOT NULL,patch INTEGER NOT NULL); INSERT INTO version_info(component,major,minor,patch) VALUES ('database_schema',1,2,0);",
+        );
+
+        let err = sqlite_persistence::validate_schema_version(&db_path)
+            .expect_err("unknown schema version should be rejected");
+        assert_eq!(err, "Unknown database_schema version 1.2.0");
+        let err = sqlite_persistence::save(&db_path, &[], &[])
+            .expect_err("save should not rewrite unknown schema versions");
+        assert_eq!(err, "Unknown database_schema version 1.2.0");
+
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(format!("{}-wal", db_path));
+        let _ = fs::remove_file(format!("{}-shm", db_path));
+        let _ = fs::remove_dir(&dir);
     }
 
     #[test]
