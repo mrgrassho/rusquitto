@@ -16,6 +16,13 @@ pub struct Subscription {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedSession {
+    pub client_id: String,
+    pub session_expiry_interval: u32,
+    pub subscriptions: Vec<Subscription>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DeliverySpec {
     client_id: String,
     qos: u8,
@@ -101,6 +108,63 @@ impl BrokerState {
 
     pub fn retained_snapshot(&self) -> Vec<Publication> {
         self.retained.values().cloned().collect()
+    }
+
+    pub fn restore_sessions(&mut self, sessions: Vec<PersistedSession>) {
+        for session in sessions {
+            if session.client_id.is_empty() || session.session_expiry_interval == 0 {
+                continue;
+            }
+
+            let mut subscriptions = HashMap::new();
+            for mut subscription in session.subscriptions {
+                if !Self::valid_subscription(&subscription) {
+                    continue;
+                }
+                subscription.order = self.next_subscription_order;
+                self.next_subscription_order += 1;
+                subscriptions.insert(subscription.filter.clone(), subscription);
+            }
+
+            self.clients.insert(
+                session.client_id.clone(),
+                ClientSession {
+                    client_id: session.client_id,
+                    subscriptions,
+                    will: None,
+                    queued: Vec::new(),
+                    inflight_qos1: BTreeMap::new(),
+                    inflight_qos2: BTreeMap::new(),
+                    inbound_qos2: BTreeMap::new(),
+                    session_expiry_interval: session.session_expiry_interval,
+                    disconnected_at: None,
+                    online: false,
+                },
+            );
+        }
+    }
+
+    pub fn session_snapshot(&self) -> Vec<PersistedSession> {
+        let mut sessions: Vec<_> = self
+            .clients
+            .values()
+            .filter(|session| session.session_expiry_interval != 0)
+            .map(|session| {
+                let mut subscriptions: Vec<_> = session.subscriptions.values().cloned().collect();
+                subscriptions.sort_by(|left, right| {
+                    left.order
+                        .cmp(&right.order)
+                        .then_with(|| left.filter.cmp(&right.filter))
+                });
+                PersistedSession {
+                    client_id: session.client_id.clone(),
+                    session_expiry_interval: session.session_expiry_interval,
+                    subscriptions,
+                }
+            })
+            .collect();
+        sessions.sort_by(|left, right| left.client_id.cmp(&right.client_id));
+        sessions
     }
 
     pub fn connect(
@@ -535,6 +599,15 @@ impl BrokerState {
 
     fn valid_publication(publication: &Publication) -> bool {
         topic::check_publish_topic(&publication.topic).is_ok() && publication.qos <= 2
+    }
+
+    fn valid_subscription(subscription: &Subscription) -> bool {
+        topic::check_subscribe_topic(&subscription.filter).is_ok()
+            && subscription.qos <= 2
+            && subscription.retain_handling <= 2
+            && subscription
+                .identifier
+                .map_or(true, |identifier| identifier > 0)
     }
 
     fn delivery_qos(&self, publish_qos: u8, subscription_qos: u8) -> u8 {
@@ -1212,6 +1285,69 @@ mod tests {
         let reconnect = broker.connect("sub".into(), false, None, 60);
         assert_eq!(reconnect.queued.len(), 1);
         assert_eq!(reconnect.queued[0].subscription_identifiers, vec![88]);
+    }
+
+    #[test]
+    fn snapshots_durable_sessions_for_persistence() {
+        let mut broker = BrokerState::new();
+        broker.connect("durable".into(), false, None, 60);
+        broker.subscribe(
+            "durable",
+            vec![SubscriptionRequest {
+                filter: "persist/b".into(),
+                qos: 1,
+                no_local: true,
+                retain_as_published: true,
+                retain_handling: 2,
+                identifier: Some(9),
+            }],
+        );
+        broker.connect("clean".into(), true, None, 0);
+
+        let snapshot = broker.session_snapshot();
+
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].client_id, "durable");
+        assert_eq!(snapshot[0].session_expiry_interval, 60);
+        assert_eq!(snapshot[0].subscriptions.len(), 1);
+        let subscription = &snapshot[0].subscriptions[0];
+        assert_eq!(subscription.filter, "persist/b");
+        assert_eq!(subscription.qos, 1);
+        assert!(subscription.no_local);
+        assert!(subscription.retain_as_published);
+        assert_eq!(subscription.retain_handling, 2);
+        assert_eq!(subscription.identifier, Some(9));
+    }
+
+    #[test]
+    fn restores_persisted_sessions_for_reconnect_and_routing() {
+        let mut broker = BrokerState::new();
+        broker.restore_sessions(vec![PersistedSession {
+            client_id: "durable".into(),
+            session_expiry_interval: 60,
+            subscriptions: vec![Subscription {
+                filter: "persist/#".into(),
+                qos: 1,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+                identifier: Some(12),
+                order: 99,
+            }],
+        }]);
+
+        let mut queued = publication("persist/topic", false);
+        queued.qos = 1;
+        let publish_result = broker.publish("pub", queued);
+        assert!(publish_result.accepted);
+        assert!(publish_result.deliveries.is_empty());
+
+        let reconnect = broker.connect("durable".into(), false, None, 60);
+        assert!(reconnect.session_present);
+        assert_eq!(reconnect.queued.len(), 1);
+        assert_eq!(reconnect.queued[0].topic, "persist/topic");
+        assert_eq!(reconnect.queued[0].qos, 1);
+        assert_eq!(reconnect.queued[0].subscription_identifiers, vec![12]);
     }
 
     #[test]
