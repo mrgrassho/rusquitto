@@ -65,6 +65,7 @@ pub struct ClientSession {
     pub session_expiry_interval: u32,
     pub disconnected_at: Option<Instant>,
     pub online: bool,
+    pub next_outgoing_mid: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,14 +80,12 @@ pub struct BrokerState {
     retained: BTreeMap<String, Publication>,
     shared_cursors: HashMap<(String, String), usize>,
     upgrade_outgoing_qos: bool,
-    next_outgoing_mid: u16,
     next_subscription_order: u64,
 }
 
 impl BrokerState {
     pub fn new() -> Self {
         Self {
-            next_outgoing_mid: 1,
             next_subscription_order: 1,
             ..Self::default()
         }
@@ -115,11 +114,11 @@ impl BrokerState {
     }
 
     pub fn restore_sessions(&mut self, sessions: Vec<PersistedSession>) {
-        let mut max_packet_id: Option<u16> = None;
         for session in sessions {
             if session.client_id.is_empty() || session.session_expiry_interval == 0 {
                 continue;
             }
+            let mut max_packet_id: Option<u16> = None;
 
             let mut subscriptions = HashMap::new();
             for mut subscription in session.subscriptions {
@@ -186,17 +185,9 @@ impl BrokerState {
                     session_expiry_interval: session.session_expiry_interval,
                     disconnected_at: None,
                     online: false,
+                    next_outgoing_mid: Self::next_after_packet_id(max_packet_id),
                 },
             );
-        }
-        if let Some(max_packet_id) = max_packet_id {
-            if self.next_outgoing_mid <= max_packet_id {
-                self.next_outgoing_mid = if max_packet_id == u16::MAX {
-                    1
-                } else {
-                    max_packet_id + 1
-                };
-            }
         }
     }
 
@@ -278,6 +269,7 @@ impl BrokerState {
                     session_expiry_interval,
                     disconnected_at: None,
                     online: true,
+                    next_outgoing_mid: 1,
                 },
             );
         } else if let Some(session) = self.clients.get_mut(&client_id) {
@@ -474,7 +466,7 @@ impl BrokerState {
                         .push(identifier);
                 }
                 if retained_publication.qos > 0 {
-                    retained_publication.packet_id = Some(self.next_packet_id());
+                    retained_publication.packet_id = self.next_packet_id_for(client_id);
                 }
                 self.track_outgoing(client_id, &retained_publication);
                 retained.push(Delivery {
@@ -660,7 +652,11 @@ impl BrokerState {
             if let Some(identifier) = spec.identifier {
                 outgoing.subscription_identifiers.push(identifier);
             }
-            outgoing.packet_id = (outgoing.qos > 0).then(|| self.next_packet_id());
+            outgoing.packet_id = if outgoing.qos > 0 {
+                self.next_packet_id_for(&spec.client_id)
+            } else {
+                None
+            };
             if spec.online {
                 self.track_outgoing(&spec.client_id, &outgoing);
                 deliveries.push(Delivery {
@@ -776,14 +772,22 @@ impl BrokerState {
         });
     }
 
-    fn next_packet_id(&mut self) -> u16 {
-        let id = self.next_outgoing_mid;
-        self.next_outgoing_mid = if self.next_outgoing_mid == u16::MAX {
+    fn next_packet_id_for(&mut self, client_id: &str) -> Option<u16> {
+        let session = self.clients.get_mut(client_id)?;
+        let id = session.next_outgoing_mid;
+        session.next_outgoing_mid = if session.next_outgoing_mid == u16::MAX {
             1
         } else {
-            self.next_outgoing_mid + 1
+            session.next_outgoing_mid + 1
         };
-        id
+        Some(id)
+    }
+
+    fn next_after_packet_id(max_packet_id: Option<u16>) -> u16 {
+        match max_packet_id {
+            Some(u16::MAX) | None => 1,
+            Some(packet_id) => packet_id + 1,
+        }
     }
 }
 
@@ -858,6 +862,52 @@ mod tests {
         assert!(result.accepted);
         assert_eq!(result.deliveries.len(), 1);
         assert_eq!(result.deliveries[0].client_id, "sub");
+    }
+
+    #[test]
+    fn assigns_outbound_packet_ids_per_client_session() {
+        let mut broker = BrokerState::new();
+        for client_id in ["sub-a", "sub-b"] {
+            broker.connect(client_id.into(), true, None, 0);
+            broker.subscribe(
+                client_id,
+                vec![SubscriptionRequest {
+                    filter: "topic".into(),
+                    qos: 1,
+                    no_local: false,
+                    retain_as_published: false,
+                    retain_handling: 0,
+                    identifier: None,
+                }],
+            );
+        }
+
+        let mut first = publication("topic", false);
+        first.qos = 1;
+        first.packet_id = Some(10);
+        let first = broker.publish("pub-a", first);
+        let mut mids: Vec<_> = first
+            .deliveries
+            .iter()
+            .map(|delivery| (delivery.client_id.as_str(), delivery.publication.packet_id))
+            .collect();
+        mids.sort_unstable();
+        assert_eq!(mids, vec![("sub-a", Some(1)), ("sub-b", Some(1))]);
+
+        broker.puback("sub-a", 1);
+        broker.puback("sub-b", 1);
+
+        let mut second = publication("topic", false);
+        second.qos = 1;
+        second.packet_id = Some(11);
+        let second = broker.publish("pub-b", second);
+        let mut mids: Vec<_> = second
+            .deliveries
+            .iter()
+            .map(|delivery| (delivery.client_id.as_str(), delivery.publication.packet_id))
+            .collect();
+        mids.sort_unstable();
+        assert_eq!(mids, vec![("sub-a", Some(2)), ("sub-b", Some(2))]);
     }
 
     #[test]
