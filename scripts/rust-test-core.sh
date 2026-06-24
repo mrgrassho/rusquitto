@@ -25,6 +25,7 @@ export BUILD_ROOT="$test_root"
     python3 01-connect-auto-id.py
     python3 01-connect-zero-length-id.py
     python3 01-connect-accept-protocol.py
+    python3 01-connect-windows-line-endings.py
     python3 02-shared-qos0-v5.py
     python3 02-subpub-recover-subscriptions.py
     python3 02-subpub-qos0-long-topic.py
