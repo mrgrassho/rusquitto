@@ -1,5 +1,6 @@
 use std::fmt;
 use std::io::{self, Read};
+use std::time::Instant;
 
 const CMD_CONNECT: u8 = 0x10;
 const CMD_CONNACK: u8 = 0x20;
@@ -83,6 +84,7 @@ pub struct Will {
     pub payload: Vec<u8>,
     pub qos: u8,
     pub retain: bool,
+    pub message_expiry_interval: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +99,8 @@ pub struct Publication {
     pub payload_format_indicator: Option<u8>,
     pub response_topic: Option<String>,
     pub correlation_data: Option<Vec<u8>>,
+    pub message_expiry_interval: Option<u32>,
+    pub message_expiry_started_at: Option<Instant>,
     pub subscription_identifiers: Vec<u32>,
 }
 
@@ -265,14 +269,17 @@ fn decode_connect(cursor: &mut Cursor<'_>) -> Result<MqttPacket, ProtocolError> 
 
     let client_id = cursor.read_utf8()?;
     let will = if will_flag {
-        if protocol == ProtocolVersion::V5 {
-            cursor.skip_properties()?;
-        }
+        let will_properties = if protocol == ProtocolVersion::V5 {
+            cursor.read_will_properties()?
+        } else {
+            WillProperties::default()
+        };
         Some(Will {
             topic: cursor.read_utf8()?,
             payload: cursor.read_binary()?,
             qos: will_qos,
             retain: will_retain,
+            message_expiry_interval: will_properties.message_expiry_interval,
         })
     } else {
         None
@@ -335,6 +342,8 @@ fn decode_publish(
         payload_format_indicator: publish_properties.payload_format_indicator,
         response_topic: publish_properties.response_topic,
         correlation_data: publish_properties.correlation_data,
+        message_expiry_interval: publish_properties.message_expiry_interval,
+        message_expiry_started_at: None,
         subscription_identifiers: publish_properties.subscription_identifiers,
     }))
 }
@@ -581,6 +590,10 @@ pub fn encode_publish(protocol: ProtocolVersion, publication: &Publication) -> V
             properties.push(PROP_PAYLOAD_FORMAT_INDICATOR as u8);
             properties.push(payload_format_indicator);
         }
+        if let Some(message_expiry_interval) = publication.message_expiry_interval {
+            properties.push(PROP_MESSAGE_EXPIRY_INTERVAL as u8);
+            write_u32(message_expiry_interval, &mut properties);
+        }
         if let Some(response_topic) = &publication.response_topic {
             properties.push(PROP_RESPONSE_TOPIC as u8);
             write_utf8(response_topic, &mut properties);
@@ -708,7 +721,13 @@ struct PublishProperties {
     payload_format_indicator: Option<u8>,
     response_topic: Option<String>,
     correlation_data: Option<Vec<u8>>,
+    message_expiry_interval: Option<u32>,
     subscription_identifiers: Vec<u32>,
+}
+
+#[derive(Debug, Default)]
+struct WillProperties {
+    message_expiry_interval: Option<u32>,
 }
 
 impl<'a> Cursor<'a> {
@@ -787,6 +806,28 @@ impl<'a> Cursor<'a> {
         let len = self.read_varint()? as usize;
         self.read_bytes(len)?;
         Ok(())
+    }
+
+    fn read_will_properties(&mut self) -> Result<WillProperties, ProtocolError> {
+        let len = self.read_varint()? as usize;
+        if self.remaining() < len {
+            return Err(ProtocolError::MalformedPacket("truncated properties"));
+        }
+        let end = self.pos + len;
+        let mut properties = WillProperties::default();
+        while self.pos < end {
+            let identifier = self.read_varint()?;
+            match identifier {
+                PROP_MESSAGE_EXPIRY_INTERVAL => {
+                    properties.message_expiry_interval = Some(self.read_u32()?);
+                }
+                _ => self.skip_property_value(identifier)?,
+            }
+        }
+        if self.pos != end {
+            return Err(ProtocolError::MalformedPacket("property length mismatch"));
+        }
+        Ok(properties)
     }
 
     fn read_connect_properties(&mut self) -> Result<ConnectProperties, ProtocolError> {
@@ -883,6 +924,9 @@ impl<'a> Cursor<'a> {
             match identifier {
                 PROP_PAYLOAD_FORMAT_INDICATOR => {
                     properties.payload_format_indicator = Some(self.read_u8()?);
+                }
+                PROP_MESSAGE_EXPIRY_INTERVAL => {
+                    properties.message_expiry_interval = Some(self.read_u32()?);
                 }
                 PROP_TOPIC_ALIAS => {
                     properties.topic_alias = Some(self.read_u16()?);
@@ -1184,6 +1228,27 @@ mod tests {
     }
 
     #[test]
+    fn decodes_mqtt_v5_publish_message_expiry() {
+        let packet = decode_frame(
+            &Frame {
+                command: CMD_PUBLISH,
+                flags: 0x02,
+                body: vec![0, 1, b'a', 0x12, 0x34, 5, 0x02, 0, 0, 0, 10, b'p'],
+            },
+            Some(ProtocolVersion::V5),
+        )
+        .unwrap();
+        match packet {
+            MqttPacket::Publish(publication) => {
+                assert_eq!(publication.message_expiry_interval, Some(10));
+                assert_eq!(publication.message_expiry_started_at, None);
+                assert_eq!(publication.payload, b"p");
+            }
+            other => panic!("unexpected packet: {other:?}"),
+        }
+    }
+
+    #[test]
     fn rejects_zero_packet_identifier() {
         let publish = decode_frame(
             &Frame {
@@ -1221,6 +1286,8 @@ mod tests {
                 payload_format_indicator: None,
                 response_topic: None,
                 correlation_data: None,
+                message_expiry_interval: None,
+                message_expiry_started_at: None,
                 subscription_identifiers: Vec::new(),
             },
         );
@@ -1306,6 +1373,8 @@ mod tests {
                 payload_format_indicator: None,
                 response_topic: None,
                 correlation_data: None,
+                message_expiry_interval: None,
+                message_expiry_started_at: None,
                 subscription_identifiers: vec![321],
             },
         );
@@ -1340,6 +1409,33 @@ mod tests {
     }
 
     #[test]
+    fn encodes_mqtt_v5_publish_message_expiry() {
+        let encoded = encode_publish(
+            ProtocolVersion::V5,
+            &Publication {
+                topic: "a".into(),
+                payload: b"p".to_vec(),
+                qos: 1,
+                retain: false,
+                packet_id: Some(0x1234),
+                dup: false,
+                topic_alias: None,
+                payload_format_indicator: None,
+                response_topic: None,
+                correlation_data: None,
+                message_expiry_interval: Some(10),
+                message_expiry_started_at: None,
+                subscription_identifiers: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            encoded,
+            vec![0x32, 12, 0, 1, b'a', 0x12, 0x34, 5, 0x02, 0, 0, 0, 10, b'p']
+        );
+    }
+
+    #[test]
     fn encodes_mqtt_v5_publish_response_properties() {
         let encoded = encode_publish(
             ProtocolVersion::V5,
@@ -1354,6 +1450,8 @@ mod tests {
                 payload_format_indicator: Some(1),
                 response_topic: Some("response/topic".to_owned()),
                 correlation_data: Some(b"corr".to_vec()),
+                message_expiry_interval: None,
+                message_expiry_started_at: None,
                 subscription_identifiers: Vec::new(),
             },
         );

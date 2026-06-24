@@ -957,6 +957,8 @@ mod sqlite_persistence {
                 payload_format_indicator: None,
                 response_topic: None,
                 correlation_data: None,
+                message_expiry_interval: None,
+                message_expiry_started_at: None,
                 subscription_identifiers: Vec::new(),
             });
         }
@@ -1121,6 +1123,8 @@ mod sqlite_persistence {
                 payload_format_indicator: None,
                 response_topic: None,
                 correlation_data: None,
+                message_expiry_interval: None,
+                message_expiry_started_at: None,
                 subscription_identifiers: subscription_identifier.into_iter().collect(),
             };
             match (direction, state) {
@@ -1618,6 +1622,10 @@ fn handle_client(
         let _ = tx.send(encode_pubrel(protocol, packet_id));
     }
 
+    if keep_alive > 0 {
+        stream.set_read_timeout(Some(Duration::from_secs(keep_alive as u64)))?;
+    }
+
     let mut topic_aliases: HashMap<u16, String> = HashMap::new();
     while let Ok(frame) = read_frame(&mut stream) {
         if packet_exceeds_maximum(&frame, settings.max_packet_size) {
@@ -2077,6 +2085,8 @@ mod tests {
             payload_format_indicator: None,
             response_topic: None,
             correlation_data: None,
+            message_expiry_interval: None,
+            message_expiry_started_at: None,
             subscription_identifiers: Vec::new(),
         }
     }
@@ -2099,6 +2109,8 @@ mod tests {
             payload_format_indicator: None,
             response_topic: None,
             correlation_data: None,
+            message_expiry_interval: None,
+            message_expiry_started_at: None,
             subscription_identifiers: subscription_identifier.into_iter().collect(),
         }
     }

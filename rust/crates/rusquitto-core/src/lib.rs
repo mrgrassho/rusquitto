@@ -253,7 +253,8 @@ impl BrokerState {
         will: Option<Will>,
         session_expiry_interval: u32,
     ) -> ConnectResult {
-        self.expire_sessions_at(Instant::now());
+        let now = Instant::now();
+        self.expire_sessions_at(now);
         let session_present = !clean_start && self.clients.contains_key(&client_id);
         if clean_start || !self.clients.contains_key(&client_id) {
             self.clients.insert(
@@ -286,13 +287,15 @@ impl BrokerState {
                 let mut pending = Vec::new();
                 for publication in session.inflight_qos1.values_mut() {
                     publication.dup = true;
-                    pending.push(publication.clone());
+                    if let Some(publication) = Self::publication_for_delivery(publication, now) {
+                        pending.push(publication);
+                    }
                 }
 
                 pending.extend(session.inflight_qos2.values_mut().filter_map(|outbound| {
                     if outbound.state == Qos2OutboundState::WaitingPubRec {
                         outbound.publication.dup = true;
-                        Some(outbound.publication.clone())
+                        Self::publication_for_delivery(&outbound.publication, now)
                     } else {
                         None
                     }
@@ -307,7 +310,11 @@ impl BrokerState {
                     .collect();
 
                 let queued = std::mem::take(&mut session.queued);
-                for publication in &queued {
+                for publication in queued {
+                    let Some(publication) = Self::publication_for_delivery(&publication, now)
+                    else {
+                        continue;
+                    };
                     if let Some(packet_id) = publication.packet_id {
                         match publication.qos {
                             1 => {
@@ -325,8 +332,8 @@ impl BrokerState {
                             _ => {}
                         }
                     }
+                    pending.push(publication);
                 }
-                pending.extend(queued);
                 (pending, pubrels)
             })
             .unwrap_or_default();
@@ -372,6 +379,8 @@ impl BrokerState {
                 payload_format_indicator: None,
                 response_topic: None,
                 correlation_data: None,
+                message_expiry_interval: will.message_expiry_interval,
+                message_expiry_started_at: None,
                 subscription_identifiers: Vec::new(),
             };
             let deliveries = self.publish(client_id, publication).deliveries;
@@ -449,12 +458,14 @@ impl BrokerState {
         }
         self.next_subscription_order = next_subscription_order;
 
+        let now = Instant::now();
+        self.remove_expired_retained(now);
         for subscription in replay_filters {
             let matching: Vec<Publication> = self
                 .retained
                 .values()
                 .filter(|publication| topic::matches(&subscription.filter, &publication.topic))
-                .cloned()
+                .filter_map(|publication| Self::publication_for_delivery(publication, now))
                 .collect();
 
             for publication in matching {
@@ -598,7 +609,16 @@ impl BrokerState {
                 deliveries: Vec::new(),
             };
         }
+        let now = Instant::now();
         publication.subscription_identifiers.clear();
+        Self::start_message_expiry(&mut publication, now);
+        if Self::publication_expired(&publication, now) {
+            return PublishResult {
+                accepted: true,
+                matched_subscribers: false,
+                deliveries: Vec::new(),
+            };
+        }
 
         if publication.retain {
             if publication.payload.is_empty() {
@@ -659,7 +679,9 @@ impl BrokerState {
         let matched_subscribers = !delivery_specs.is_empty();
 
         for spec in delivery_specs {
-            let mut outgoing = publication.clone();
+            let Some(mut outgoing) = Self::publication_for_delivery(&publication, now) else {
+                continue;
+            };
             outgoing.qos = spec.qos;
             outgoing.retain = spec.retain_as_published && outgoing.retain;
             if let Some(identifier) = spec.identifier {
@@ -715,6 +737,44 @@ impl BrokerState {
             .subscription_identifiers
             .retain(|identifier| *identifier > 0);
         Some(publication)
+    }
+
+    fn start_message_expiry(publication: &mut Publication, now: Instant) {
+        if publication.message_expiry_interval.is_some()
+            && publication.message_expiry_started_at.is_none()
+        {
+            publication.message_expiry_started_at = Some(now);
+        }
+    }
+
+    fn publication_expired(publication: &Publication, now: Instant) -> bool {
+        let Some(interval) = publication.message_expiry_interval else {
+            return false;
+        };
+        let Some(started_at) = publication.message_expiry_started_at else {
+            return interval == 0;
+        };
+        now.duration_since(started_at).as_secs() >= interval as u64
+    }
+
+    fn publication_for_delivery(publication: &Publication, now: Instant) -> Option<Publication> {
+        let Some(interval) = publication.message_expiry_interval else {
+            return Some(publication.clone());
+        };
+        let started_at = publication.message_expiry_started_at.unwrap_or(now);
+        let elapsed = now.duration_since(started_at).as_secs();
+        if elapsed >= interval as u64 {
+            return None;
+        }
+        let mut publication = publication.clone();
+        publication.message_expiry_interval = Some(interval - elapsed as u32);
+        publication.message_expiry_started_at = Some(started_at);
+        Some(publication)
+    }
+
+    fn remove_expired_retained(&mut self, now: Instant) {
+        self.retained
+            .retain(|_, publication| !Self::publication_expired(publication, now));
     }
 
     fn valid_inflight_publication(
@@ -847,6 +907,8 @@ mod tests {
             payload_format_indicator: None,
             response_topic: None,
             correlation_data: None,
+            message_expiry_interval: None,
+            message_expiry_started_at: None,
             subscription_identifiers: Vec::new(),
         }
     }
@@ -1212,6 +1274,7 @@ mod tests {
                 payload: b"gone".to_vec(),
                 qos: 0,
                 retain: false,
+                message_expiry_interval: None,
             }),
             0,
         );
