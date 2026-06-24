@@ -597,6 +597,18 @@ impl BrokerState {
             .is_some_and(|session| session.inflight_qos2.contains_key(&packet_id))
     }
 
+    pub fn has_inbound_qos2(&self, client_id: &str, packet_id: u16) -> bool {
+        self.clients
+            .get(client_id)
+            .is_some_and(|session| session.inbound_qos2.contains_key(&packet_id))
+    }
+
+    pub fn inbound_qos2_count(&self, client_id: &str) -> usize {
+        self.clients
+            .get(client_id)
+            .map_or(0, |session| session.inbound_qos2.len())
+    }
+
     pub fn publish(
         &mut self,
         source_client_id: &str,
@@ -1428,12 +1440,13 @@ mod tests {
         let first = broker.receive_qos2_publish("pub", inbound.clone());
         assert!(first.accepted);
         assert!(!first.duplicate);
-        assert_eq!(broker.clients["pub"].inbound_qos2.len(), 1);
+        assert_eq!(broker.inbound_qos2_count("pub"), 1);
+        assert!(broker.has_inbound_qos2("pub", 7));
 
         let duplicate = broker.receive_qos2_publish("pub", inbound);
         assert!(duplicate.accepted);
         assert!(duplicate.duplicate);
-        assert_eq!(broker.clients["pub"].inbound_qos2.len(), 1);
+        assert_eq!(broker.inbound_qos2_count("pub"), 1);
 
         let released = broker.pubrel("pub", 7).unwrap();
         assert!(released.accepted);

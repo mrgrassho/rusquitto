@@ -44,6 +44,8 @@ export BUILD_ROOT="$test_root"
     python3 03-publish-qos1-max-inflight.py
     python3 03-publish-qos1-no-subscribers-v5.py
     python3 03-publish-qos1-retain-disabled.py
+    python3 03-publish-qos2-max-inflight.py
+    python3 03-publish-qos2-max-inflight-exceeded.py
     python3 04-retain-clear-multiple.py
     python3 04-retain-qos0-repeated.py
     python3 04-retain-upgrade-outgoing-qos.py

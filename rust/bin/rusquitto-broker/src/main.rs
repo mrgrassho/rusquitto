@@ -25,6 +25,7 @@ const MQTT_RC_NO_MATCHING_SUBSCRIBERS: u8 = 0x10;
 const MQTT_RC_MALFORMED_PACKET: u8 = 0x81;
 const MQTT_RC_PROTOCOL_ERROR: u8 = 0x82;
 const MQTT_RC_NOT_AUTHORIZED: u8 = 0x87;
+const MQTT_RC_RECEIVE_MAXIMUM_EXCEEDED: u8 = 0x93;
 const MQTT_RC_PACKET_TOO_LARGE: u8 = 0x95;
 const MQTT_RC_SESSION_TAKEN_OVER: u8 = 0x8E;
 const MQTT_RC_RETAIN_NOT_SUPPORTED: u8 = 0x9A;
@@ -1720,6 +1721,21 @@ fn handle_client(
                             }
                             break;
                         };
+                        let receive_maximum = settings.max_inflight_messages.unwrap_or(20) as usize;
+                        let receive_maximum_exceeded = {
+                            let broker = broker.lock().expect("broker lock poisoned");
+                            !broker.has_inbound_qos2(&client_id, packet_id)
+                                && broker.inbound_qos2_count(&client_id) >= receive_maximum
+                        };
+                        if receive_maximum_exceeded {
+                            if protocol == ProtocolVersion::V5 {
+                                let _ = tx.send(encode_disconnect(
+                                    protocol,
+                                    MQTT_RC_RECEIVE_MAXIMUM_EXCEEDED,
+                                ));
+                            }
+                            break;
+                        }
                         let result = broker
                             .lock()
                             .expect("broker lock poisoned")
