@@ -17,12 +17,14 @@ use rusquitto_core::{
 use rusquitto_protocol::{
     decode_frame, encode_connack, encode_connack_with_options, encode_disconnect, encode_pingresp,
     encode_puback, encode_pubcomp, encode_publish, encode_pubrec, encode_pubrel, encode_suback,
-    encode_unsuback, read_frame, topic, ConnackOptions, MqttPacket, ProtocolVersion, Publication,
+    encode_unsuback, read_frame, topic, ConnackOptions, Frame, MqttPacket, ProtocolVersion,
+    Publication,
 };
 
 const MQTT_RC_MALFORMED_PACKET: u8 = 0x81;
 const MQTT_RC_PROTOCOL_ERROR: u8 = 0x82;
 const MQTT_RC_NOT_AUTHORIZED: u8 = 0x87;
+const MQTT_RC_PACKET_TOO_LARGE: u8 = 0x95;
 const MQTT_RC_RETAIN_NOT_SUPPORTED: u8 = 0x9A;
 const UNKNOWN_SCHEMA_VERSION_PREFIX: &str = "Unknown database_schema version ";
 static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -66,6 +68,7 @@ struct Settings {
     upgrade_outgoing_qos: bool,
     persistence_db_file: Option<String>,
     max_keepalive: Option<u16>,
+    max_packet_size: Option<u32>,
     password_file: Option<HashMap<String, PasswordEntry>>,
     acl_file: Option<AclFile>,
     acl_file_path: Option<String>,
@@ -124,6 +127,7 @@ impl Default for Settings {
             upgrade_outgoing_qos: false,
             persistence_db_file: None,
             max_keepalive: None,
+            max_packet_size: None,
             password_file: None,
             acl_file: None,
             acl_file_path: None,
@@ -420,6 +424,11 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
                 "max_keepalive" => {
                     if let Some(value) = value.and_then(|value| value.parse::<u16>().ok()) {
                         settings.max_keepalive = Some(value);
+                    }
+                }
+                "max_packet_size" => {
+                    if let Some(value) = value.and_then(|value| value.parse::<u32>().ok()) {
+                        settings.max_packet_size = Some(value);
                     }
                 }
                 "password_file" => {
@@ -1409,7 +1418,7 @@ fn handle_client(
             retain_available: settings.retain_available,
             assigned_client_id: assigned_client_id.as_deref(),
             server_keep_alive,
-            ..ConnackOptions::default()
+            maximum_packet_size: settings.max_packet_size.unwrap_or(2_000_000),
         },
     ))?;
 
@@ -1463,6 +1472,12 @@ fn handle_client(
 
     let mut topic_aliases: HashMap<u16, String> = HashMap::new();
     while let Ok(frame) = read_frame(&mut stream) {
+        if packet_exceeds_maximum(&frame, settings.max_packet_size) {
+            if protocol == ProtocolVersion::V5 {
+                let _ = tx.send(encode_disconnect(protocol, MQTT_RC_PACKET_TOO_LARGE));
+            }
+            break;
+        }
         let packet = match decode_frame(&frame, Some(protocol)) {
             Ok(packet) => packet,
             Err(_) => {
@@ -1722,6 +1737,24 @@ fn resolve_topic_alias(
         }
     } else {
         !publication.topic.is_empty()
+    }
+}
+
+fn packet_exceeds_maximum(frame: &Frame, max_packet_size: Option<u32>) -> bool {
+    max_packet_size
+        .is_some_and(|max_packet_size| encoded_packet_size(frame) > max_packet_size as usize)
+}
+
+fn encoded_packet_size(frame: &Frame) -> usize {
+    1 + remaining_length_byte_count(frame.body.len()) + frame.body.len()
+}
+
+fn remaining_length_byte_count(remaining_length: usize) -> usize {
+    match remaining_length {
+        0..=127 => 1,
+        128..=16_383 => 2,
+        16_384..=2_097_151 => 3,
+        _ => 4,
     }
 }
 
@@ -2050,6 +2083,37 @@ mod tests {
         assert_eq!(settings.max_keepalive, Some(60));
 
         let _ = fs::remove_file(config);
+    }
+
+    #[test]
+    fn parse_settings_reads_max_packet_size() {
+        let config = write_temp_config("listener 18887\nmax_packet_size 50\n");
+
+        let settings =
+            parse_settings(vec!["-c".to_owned(), config.clone()]).expect("settings should parse");
+
+        assert_eq!(settings.max_packet_size, Some(50));
+
+        let _ = fs::remove_file(config);
+    }
+
+    #[test]
+    fn packet_size_uses_fixed_header_and_remaining_length_bytes() {
+        let small = Frame {
+            command: 0x30,
+            flags: 0,
+            body: vec![0; 10],
+        };
+        assert_eq!(encoded_packet_size(&small), 12);
+        assert!(!packet_exceeds_maximum(&small, Some(12)));
+        assert!(packet_exceeds_maximum(&small, Some(11)));
+
+        let large = Frame {
+            command: 0x30,
+            flags: 0,
+            body: vec![0; 128],
+        };
+        assert_eq!(encoded_packet_size(&large), 131);
     }
 
     #[test]

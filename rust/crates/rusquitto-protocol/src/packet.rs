@@ -912,6 +912,22 @@ mod tests {
     }
 
     #[test]
+    fn encodes_mqtt_v5_configured_maximum_packet_size() {
+        assert_eq!(
+            encode_connack_with_options(
+                ProtocolVersion::V5,
+                false,
+                0,
+                ConnackOptions {
+                    maximum_packet_size: 50,
+                    ..ConnackOptions::default()
+                },
+            ),
+            vec![0x20, 14, 0, 0, 11, 0x22, 0, 10, 0x27, 0, 0, 0, 50, 0x21, 0, 20,]
+        );
+    }
+
+    #[test]
     fn encodes_mqtt_v5_server_keep_alive() {
         assert_eq!(
             encode_connack_with_options(

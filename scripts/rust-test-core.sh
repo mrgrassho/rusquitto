@@ -41,4 +41,5 @@ export BUILD_ROOT="$test_root"
     python3 10-listener-mount-point.py
     python3 12-prop-assigned-client-identifier.py
     python3 12-prop-server-keepalive.py
+    python3 12-prop-maximum-packet-size-broker.py
 )
