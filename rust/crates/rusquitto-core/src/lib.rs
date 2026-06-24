@@ -20,6 +20,7 @@ pub struct PersistedSession {
     pub client_id: String,
     pub session_expiry_interval: u32,
     pub subscriptions: Vec<Subscription>,
+    pub queued: Vec<Publication>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +112,7 @@ impl BrokerState {
     }
 
     pub fn restore_sessions(&mut self, sessions: Vec<PersistedSession>) {
+        let mut max_packet_id: Option<u16> = None;
         for session in sessions {
             if session.client_id.is_empty() || session.session_expiry_interval == 0 {
                 continue;
@@ -126,13 +128,25 @@ impl BrokerState {
                 subscriptions.insert(subscription.filter.clone(), subscription);
             }
 
+            let queued: Vec<_> = session
+                .queued
+                .into_iter()
+                .filter_map(Self::valid_queued_publication)
+                .inspect(|publication| {
+                    if let Some(packet_id) = publication.packet_id {
+                        max_packet_id =
+                            Some(max_packet_id.map_or(packet_id, |max| max.max(packet_id)));
+                    }
+                })
+                .collect();
+
             self.clients.insert(
                 session.client_id.clone(),
                 ClientSession {
                     client_id: session.client_id,
                     subscriptions,
                     will: None,
-                    queued: Vec::new(),
+                    queued,
                     inflight_qos1: BTreeMap::new(),
                     inflight_qos2: BTreeMap::new(),
                     inbound_qos2: BTreeMap::new(),
@@ -141,6 +155,15 @@ impl BrokerState {
                     online: false,
                 },
             );
+        }
+        if let Some(max_packet_id) = max_packet_id {
+            if self.next_outgoing_mid <= max_packet_id {
+                self.next_outgoing_mid = if max_packet_id == u16::MAX {
+                    1
+                } else {
+                    max_packet_id + 1
+                };
+            }
         }
     }
 
@@ -156,10 +179,21 @@ impl BrokerState {
                         .cmp(&right.order)
                         .then_with(|| left.filter.cmp(&right.filter))
                 });
+                let queued = session
+                    .queued
+                    .iter()
+                    .filter(|publication| {
+                        publication.qos > 0
+                            && publication.packet_id.is_some()
+                            && Self::valid_publication(publication)
+                    })
+                    .cloned()
+                    .collect();
                 PersistedSession {
                     client_id: session.client_id.clone(),
                     session_expiry_interval: session.session_expiry_interval,
                     subscriptions,
+                    queued,
                 }
             })
             .collect();
@@ -608,6 +642,20 @@ impl BrokerState {
             && subscription
                 .identifier
                 .map_or(true, |identifier| identifier > 0)
+    }
+
+    fn valid_queued_publication(mut publication: Publication) -> Option<Publication> {
+        if publication.qos == 0
+            || publication.packet_id.is_none()
+            || !Self::valid_publication(&publication)
+        {
+            return None;
+        }
+        publication.topic_alias = None;
+        publication
+            .subscription_identifiers
+            .retain(|identifier| *identifier > 0);
+        Some(publication)
     }
 
     fn delivery_qos(&self, publish_qos: u8, subscription_qos: u8) -> u8 {
@@ -1334,6 +1382,7 @@ mod tests {
                 identifier: Some(12),
                 order: 99,
             }],
+            queued: Vec::new(),
         }]);
 
         let mut queued = publication("persist/topic", false);
@@ -1348,6 +1397,53 @@ mod tests {
         assert_eq!(reconnect.queued[0].topic, "persist/topic");
         assert_eq!(reconnect.queued[0].qos, 1);
         assert_eq!(reconnect.queued[0].subscription_identifiers, vec![12]);
+    }
+
+    #[test]
+    fn snapshots_and_restores_queued_messages_for_persistence() {
+        let mut broker = BrokerState::new();
+        broker.connect("durable".into(), false, None, 60);
+        broker.subscribe(
+            "durable",
+            vec![SubscriptionRequest {
+                filter: "persist/#".into(),
+                qos: 1,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+                identifier: Some(5),
+            }],
+        );
+        broker.disconnect("durable", true, None);
+
+        let mut queued = publication("persist/queued", false);
+        queued.qos = 1;
+        let publish_result = broker.publish("pub", queued);
+        assert!(publish_result.accepted);
+        assert!(publish_result.deliveries.is_empty());
+
+        let snapshot = broker.session_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].queued.len(), 1);
+        assert_eq!(snapshot[0].queued[0].packet_id, Some(1));
+
+        let mut restored = BrokerState::new();
+        restored.restore_sessions(snapshot);
+        let reconnect = restored.connect("durable".into(), false, None, 60);
+        assert!(reconnect.session_present);
+        assert_eq!(reconnect.queued.len(), 1);
+        assert_eq!(reconnect.queued[0].topic, "persist/queued");
+        assert_eq!(reconnect.queued[0].packet_id, Some(1));
+        assert_eq!(reconnect.queued[0].subscription_identifiers, vec![5]);
+        assert!(restored.puback("durable", 1));
+
+        restored.disconnect("durable", true, None);
+        let mut next = publication("persist/next", false);
+        next.qos = 1;
+        restored.publish("pub", next);
+        let reconnect = restored.connect("durable".into(), false, None, 60);
+        assert_eq!(reconnect.queued.len(), 1);
+        assert_eq!(reconnect.queued[0].packet_id, Some(2));
     }
 
     #[test]
