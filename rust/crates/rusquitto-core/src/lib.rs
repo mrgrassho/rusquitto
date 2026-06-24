@@ -497,6 +497,13 @@ impl BrokerState {
             .is_some()
     }
 
+    pub fn drop_outgoing(&mut self, client_id: &str, packet_id: u16) -> bool {
+        self.clients.get_mut(client_id).is_some_and(|session| {
+            session.inflight_qos1.remove(&packet_id).is_some()
+                || session.inflight_qos2.remove(&packet_id).is_some()
+        })
+    }
+
     pub fn has_inflight_qos1(&self, client_id: &str, packet_id: u16) -> bool {
         self.clients
             .get(client_id)

@@ -37,4 +37,5 @@ export BUILD_ROOT="$test_root"
     python3 07-will-qos0.py
     python3 09-acl-empty-file.py
     python3 09-acl-access-variants.py
+    python3 09-acl-change.py
 )

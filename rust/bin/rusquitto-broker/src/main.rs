@@ -27,6 +27,7 @@ const UNKNOWN_SCHEMA_VERSION_PREFIX: &str = "Unknown database_schema version ";
 
 type OutboundMap = Arc<Mutex<HashMap<String, ClientOutbound>>>;
 type ClientUsers = Arc<Mutex<HashMap<String, Option<String>>>>;
+type SharedAcl = Arc<Mutex<Option<AclFile>>>;
 type SharedBroker = Arc<Mutex<BrokerState>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +62,7 @@ struct Settings {
     persistence_db_file: Option<String>,
     password_file: Option<HashMap<String, PasswordEntry>>,
     acl_file: Option<AclFile>,
+    acl_file_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +118,7 @@ impl Default for Settings {
             persistence_db_file: None,
             password_file: None,
             acl_file: None,
+            acl_file_path: None,
         }
     }
 }
@@ -168,7 +171,11 @@ fn run() -> Result<(), String> {
     let broker = Arc::new(Mutex::new(broker_state));
     let outbound = Arc::new(Mutex::new(HashMap::new()));
     let client_users = Arc::new(Mutex::new(HashMap::new()));
+    let shared_acl = Arc::new(Mutex::new(settings.acl_file.clone()));
     while !shutdown::requested() {
+        if shutdown::reload_requested() {
+            reload_acl(&settings, &shared_acl);
+        }
         let mut accepted = false;
         for listener in &listeners {
             match listener.listener.accept() {
@@ -181,6 +188,7 @@ fn run() -> Result<(), String> {
                     let broker = Arc::clone(&broker);
                     let outbound = Arc::clone(&outbound);
                     let client_users = Arc::clone(&client_users);
+                    let shared_acl = Arc::clone(&shared_acl);
                     let settings = settings.clone();
                     let allow_anonymous = listener.settings.allow_anonymous;
                     thread::spawn(move || {
@@ -189,6 +197,7 @@ fn run() -> Result<(), String> {
                             broker,
                             outbound,
                             client_users,
+                            shared_acl,
                             settings,
                             allow_anonymous,
                         ) {
@@ -217,11 +226,26 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+fn reload_acl(settings: &Settings, shared_acl: &SharedAcl) {
+    let Some(path) = settings.acl_file_path.as_deref() else {
+        return;
+    };
+    match load_acl_file(path) {
+        Ok(acl_file) => {
+            *shared_acl.lock().expect("acl lock poisoned") = Some(acl_file);
+        }
+        Err(err) => {
+            eprintln!("Reload error: {err}");
+        }
+    }
+}
+
 #[cfg(unix)]
 mod shutdown {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     static REQUESTED: AtomicBool = AtomicBool::new(false);
+    static RELOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
 
     type SignalHandler = extern "C" fn(i32);
 
@@ -229,12 +253,17 @@ mod shutdown {
         fn signal(signum: i32, handler: SignalHandler) -> SignalHandler;
     }
 
-    extern "C" fn handle_signal(_signum: i32) {
-        REQUESTED.store(true, Ordering::SeqCst);
+    extern "C" fn handle_signal(signum: i32) {
+        if signum == 1 {
+            RELOAD_REQUESTED.store(true, Ordering::SeqCst);
+        } else {
+            REQUESTED.store(true, Ordering::SeqCst);
+        }
     }
 
     pub fn install() {
         unsafe {
+            let _ = signal(1, handle_signal);
             let _ = signal(2, handle_signal);
             let _ = signal(15, handle_signal);
         }
@@ -243,6 +272,10 @@ mod shutdown {
     pub fn requested() -> bool {
         REQUESTED.load(Ordering::SeqCst)
     }
+
+    pub fn reload_requested() -> bool {
+        RELOAD_REQUESTED.swap(false, Ordering::SeqCst)
+    }
 }
 
 #[cfg(not(unix))]
@@ -250,6 +283,10 @@ mod shutdown {
     pub fn install() {}
 
     pub fn requested() -> bool {
+        false
+    }
+
+    pub fn reload_requested() -> bool {
         false
     }
 }
@@ -399,6 +436,7 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
     }
     if let Some(path) = acl_file_path {
         settings.acl_file = Some(load_acl_file(&path)?);
+        settings.acl_file_path = Some(path);
     }
 
     Ok(settings)
@@ -635,13 +673,24 @@ fn parse_acl_access(value: &str) -> Option<AclAccess> {
 }
 
 fn acl_allows(
-    settings: &Settings,
+    shared_acl: &SharedAcl,
     username: Option<&str>,
     client_id: &str,
     operation: AclOperation,
     topic_name: &str,
 ) -> bool {
-    let Some(acl_file) = settings.acl_file.as_ref() else {
+    let guard = shared_acl.lock().expect("acl lock poisoned");
+    acl_file_allows(guard.as_ref(), username, client_id, operation, topic_name)
+}
+
+fn acl_file_allows(
+    acl_file: Option<&AclFile>,
+    username: Option<&str>,
+    client_id: &str,
+    operation: AclOperation,
+    topic_name: &str,
+) -> bool {
+    let Some(acl_file) = acl_file else {
         return true;
     };
     let mut allowed = false;
@@ -1247,6 +1296,7 @@ fn handle_client(
     broker: SharedBroker,
     outbound: OutboundMap,
     client_users: ClientUsers,
+    shared_acl: SharedAcl,
     settings: Settings,
     allow_anonymous: bool,
 ) -> io::Result<()> {
@@ -1334,7 +1384,20 @@ fn handle_client(
     });
 
     for publication in connect_result.queued {
-        let _ = tx.send(encode_publish(protocol, &publication));
+        if acl_allows(
+            &shared_acl,
+            username.as_deref(),
+            &client_id,
+            AclOperation::Read,
+            &publication.topic,
+        ) {
+            let _ = tx.send(encode_publish(protocol, &publication));
+        } else if let Some(packet_id) = publication.packet_id {
+            broker
+                .lock()
+                .expect("broker lock poisoned")
+                .drop_outgoing(&client_id, packet_id);
+        }
     }
     for packet_id in connect_result.pubrels {
         let _ = tx.send(encode_pubrel(protocol, packet_id));
@@ -1367,7 +1430,7 @@ fn handle_client(
                     break;
                 }
                 if !acl_allows(
-                    &settings,
+                    &shared_acl,
                     username.as_deref(),
                     &client_id,
                     AclOperation::Write,
@@ -1403,7 +1466,7 @@ fn handle_client(
                             }
                             break;
                         }
-                        send_deliveries(&settings, &client_users, &outbound, result.deliveries);
+                        send_deliveries(&shared_acl, &client_users, &outbound, result.deliveries);
                         if let Some(packet_id) = packet_id {
                             let _ = tx.send(encode_puback(protocol, packet_id));
                         }
@@ -1441,7 +1504,7 @@ fn handle_client(
                             }
                             break;
                         }
-                        send_deliveries(&settings, &client_users, &outbound, result.deliveries);
+                        send_deliveries(&shared_acl, &client_users, &outbound, result.deliveries);
                     }
                 }
             }
@@ -1457,7 +1520,7 @@ fn handle_client(
                         }
                         break;
                     }
-                    send_deliveries(&settings, &client_users, &outbound, result.deliveries);
+                    send_deliveries(&shared_acl, &client_users, &outbound, result.deliveries);
                 }
                 let _ = tx.send(encode_pubcomp(protocol, packet_id));
             }
@@ -1524,7 +1587,7 @@ fn handle_client(
                     break;
                 }
                 let _ = tx.send(encode_suback(protocol, packet_id, &result.reason_codes));
-                send_deliveries(&settings, &client_users, &outbound, result.retained);
+                send_deliveries(&shared_acl, &client_users, &outbound, result.retained);
             }
             MqttPacket::Unsubscribe { packet_id, filters } => {
                 broker
@@ -1545,7 +1608,7 @@ fn handle_client(
                     true,
                     session_expiry_interval,
                 );
-                send_deliveries(&settings, &client_users, &outbound, deliveries);
+                send_deliveries(&shared_acl, &client_users, &outbound, deliveries);
                 outbound
                     .lock()
                     .expect("outbound lock poisoned")
@@ -1572,7 +1635,7 @@ fn handle_client(
         .lock()
         .expect("broker lock poisoned")
         .disconnect(&client_id, false, None);
-    send_deliveries(&settings, &client_users, &outbound, deliveries);
+    send_deliveries(&shared_acl, &client_users, &outbound, deliveries);
     Ok(())
 }
 
@@ -1596,7 +1659,7 @@ fn resolve_topic_alias(
 }
 
 fn send_deliveries(
-    settings: &Settings,
+    shared_acl: &SharedAcl,
     client_users: &ClientUsers,
     outbound: &OutboundMap,
     deliveries: Vec<rusquitto_core::Delivery>,
@@ -1608,7 +1671,7 @@ fn send_deliveries(
             .get(&delivery.client_id)
             .and_then(|username| username.as_deref());
         if !acl_allows(
-            settings,
+            shared_acl,
             username,
             &delivery.client_id,
             AclOperation::Read,
@@ -1915,57 +1978,57 @@ mod tests {
             ..Settings::default()
         };
 
-        assert!(acl_allows(
-            &settings,
+        assert!(acl_file_allows(
+            settings.acl_file.as_ref(),
             None,
             "client",
             AclOperation::Write,
             "topic/global"
         ));
-        assert!(!acl_allows(
-            &settings,
+        assert!(!acl_file_allows(
+            settings.acl_file.as_ref(),
             Some("username"),
             "client",
             AclOperation::Write,
             "topic/global"
         ));
-        assert!(!acl_allows(
-            &settings,
+        assert!(!acl_file_allows(
+            settings.acl_file.as_ref(),
             None,
             "client",
             AclOperation::Read,
             "topic/global/except"
         ));
-        assert!(acl_allows(
-            &settings,
+        assert!(acl_file_allows(
+            settings.acl_file.as_ref(),
             Some("username"),
             "client",
             AclOperation::Read,
             "topic/username/value"
         ));
-        assert!(!acl_allows(
-            &settings,
+        assert!(!acl_file_allows(
+            settings.acl_file.as_ref(),
             Some("username"),
             "client",
             AclOperation::Read,
             "topic/username/except"
         ));
-        assert!(acl_allows(
-            &settings,
+        assert!(acl_file_allows(
+            settings.acl_file.as_ref(),
             Some("username"),
             "client",
             AclOperation::Write,
             "pattern/username/value"
         ));
-        assert!(!acl_allows(
-            &settings,
+        assert!(!acl_file_allows(
+            settings.acl_file.as_ref(),
             Some("username"),
             "client",
             AclOperation::Write,
             "pattern/username/except"
         ));
-        assert!(!acl_allows(
-            &settings,
+        assert!(!acl_file_allows(
+            settings.acl_file.as_ref(),
             None,
             "client",
             AclOperation::Write,
@@ -1987,6 +2050,45 @@ mod tests {
         assert_eq!(acl.rules.len(), 2);
         assert_eq!(acl.rules[0].filter, "topic/global/#");
         assert_eq!(acl.rules[1].filter, "pattern/%u/#");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reload_acl_replaces_shared_acl_rules() {
+        let path = env::temp_dir().join(format!("rusquitto-acl-reload-test-{}.acl", unique_id()));
+        fs::write(&path, "topic readwrite topic/one\n").expect("acl file should be written");
+        let settings = Settings {
+            acl_file_path: Some(path.to_string_lossy().to_string()),
+            acl_file: Some(load_acl_file(&path.to_string_lossy()).expect("acl should load")),
+            ..Settings::default()
+        };
+        let shared_acl = Arc::new(Mutex::new(settings.acl_file.clone()));
+        assert!(acl_allows(
+            &shared_acl,
+            None,
+            "client",
+            AclOperation::Read,
+            "topic/one"
+        ));
+
+        fs::write(&path, "topic readwrite topic/two\n").expect("acl file should be rewritten");
+        reload_acl(&settings, &shared_acl);
+
+        assert!(!acl_allows(
+            &shared_acl,
+            None,
+            "client",
+            AclOperation::Read,
+            "topic/one"
+        ));
+        assert!(acl_allows(
+            &shared_acl,
+            None,
+            "client",
+            AclOperation::Read,
+            "topic/two"
+        ));
 
         let _ = fs::remove_file(&path);
     }
