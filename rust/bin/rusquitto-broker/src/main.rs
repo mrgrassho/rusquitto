@@ -61,6 +61,7 @@ struct BoundListener {
 struct ClientOutbound {
     protocol: ProtocolVersion,
     mount_point: Option<String>,
+    maximum_packet_size: Option<u32>,
     sender: Sender<Vec<u8>>,
 }
 
@@ -926,6 +927,7 @@ mod sqlite_persistence {
                 packet_id: None,
                 dup: false,
                 topic_alias: None,
+                payload_format_indicator: None,
                 response_topic: None,
                 correlation_data: None,
                 subscription_identifiers: Vec::new(),
@@ -1089,6 +1091,7 @@ mod sqlite_persistence {
                 packet_id,
                 dup,
                 topic_alias: None,
+                payload_format_indicator: None,
                 response_topic: None,
                 correlation_data: None,
                 subscription_identifiers: subscription_identifier.into_iter().collect(),
@@ -1438,6 +1441,7 @@ fn handle_client(
             password,
             will,
             session_expiry_interval,
+            maximum_packet_size,
             keep_alive,
             ..
         }) => (
@@ -1448,6 +1452,7 @@ fn handle_client(
             password,
             will,
             session_expiry_interval,
+            maximum_packet_size,
             keep_alive,
         ),
         _ => return Ok(()),
@@ -1461,6 +1466,7 @@ fn handle_client(
         password,
         mut will,
         session_expiry_interval,
+        maximum_packet_size,
         keep_alive,
     ) = connect;
     if !protocol_accepted(settings.accept_protocol_versions.as_deref(), protocol) {
@@ -1539,6 +1545,7 @@ fn handle_client(
         ClientOutbound {
             protocol,
             mount_point: mount_point.clone(),
+            maximum_packet_size,
             sender: tx.clone(),
         },
     );
@@ -1856,6 +1863,10 @@ fn packet_exceeds_maximum(frame: &Frame, max_packet_size: Option<u32>) -> bool {
         .is_some_and(|max_packet_size| encoded_packet_size(frame) > max_packet_size as usize)
 }
 
+fn encoded_packet_exceeds_maximum(packet: &[u8], max_packet_size: Option<u32>) -> bool {
+    max_packet_size.is_some_and(|max_packet_size| packet.len() > max_packet_size as usize)
+}
+
 fn encoded_packet_size(frame: &Frame) -> usize {
     1 + remaining_length_byte_count(frame.body.len()) + frame.body.len()
 }
@@ -1945,9 +1956,10 @@ fn send_deliveries(
             if let Some(publication) =
                 mounted_outbound_publication(&delivery.publication, client.mount_point.as_deref())
             {
-                let _ = client
-                    .sender
-                    .send(encode_publish(client.protocol, &publication));
+                let packet = encode_publish(client.protocol, &publication);
+                if !encoded_packet_exceeds_maximum(&packet, client.maximum_packet_size) {
+                    let _ = client.sender.send(packet);
+                }
             }
         }
     }
@@ -1990,6 +2002,7 @@ mod tests {
             packet_id: None,
             dup: false,
             topic_alias: None,
+            payload_format_indicator: None,
             response_topic: None,
             correlation_data: None,
             subscription_identifiers: Vec::new(),
@@ -2011,6 +2024,7 @@ mod tests {
             packet_id: Some(packet_id),
             dup: false,
             topic_alias: None,
+            payload_format_indicator: None,
             response_topic: None,
             correlation_data: None,
             subscription_identifiers: subscription_identifier.into_iter().collect(),
@@ -2328,6 +2342,13 @@ mod tests {
         assert_eq!(settings.max_packet_size, Some(50));
 
         let _ = fs::remove_file(config);
+    }
+
+    #[test]
+    fn encoded_packet_maximum_checks_outbound_packet_bytes() {
+        assert!(!encoded_packet_exceeds_maximum(&[0; 40], Some(40)));
+        assert!(encoded_packet_exceeds_maximum(&[0; 41], Some(40)));
+        assert!(!encoded_packet_exceeds_maximum(&[0; 41], None));
     }
 
     #[test]

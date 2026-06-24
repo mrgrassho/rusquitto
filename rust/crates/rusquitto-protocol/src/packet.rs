@@ -94,6 +94,7 @@ pub struct Publication {
     pub packet_id: Option<u16>,
     pub dup: bool,
     pub topic_alias: Option<u16>,
+    pub payload_format_indicator: Option<u8>,
     pub response_topic: Option<String>,
     pub correlation_data: Option<Vec<u8>>,
     pub subscription_identifiers: Vec<u32>,
@@ -120,6 +121,7 @@ pub enum MqttPacket {
         password: Option<Vec<u8>>,
         will: Option<Will>,
         session_expiry_interval: Option<u32>,
+        maximum_packet_size: Option<u32>,
     },
     Publish(Publication),
     PubAck {
@@ -255,10 +257,10 @@ fn decode_connect(cursor: &mut Cursor<'_>) -> Result<MqttPacket, ProtocolError> 
     let username_flag = (flags & 0x80) != 0;
     let keep_alive = cursor.read_u16()?;
 
-    let session_expiry_interval = if protocol == ProtocolVersion::V5 {
-        cursor.read_session_expiry_property()?
+    let connect_properties = if protocol == ProtocolVersion::V5 {
+        cursor.read_connect_properties()?
     } else {
-        None
+        ConnectProperties::default()
     };
 
     let client_id = cursor.read_utf8()?;
@@ -294,7 +296,8 @@ fn decode_connect(cursor: &mut Cursor<'_>) -> Result<MqttPacket, ProtocolError> 
         username,
         password,
         will,
-        session_expiry_interval,
+        session_expiry_interval: connect_properties.session_expiry_interval,
+        maximum_packet_size: connect_properties.maximum_packet_size,
     })
 }
 
@@ -329,6 +332,7 @@ fn decode_publish(
         packet_id,
         dup,
         topic_alias: publish_properties.topic_alias,
+        payload_format_indicator: publish_properties.payload_format_indicator,
         response_topic: publish_properties.response_topic,
         correlation_data: publish_properties.correlation_data,
         subscription_identifiers: publish_properties.subscription_identifiers,
@@ -565,6 +569,10 @@ pub fn encode_publish(protocol: ProtocolVersion, publication: &Publication) -> V
     }
     if protocol == ProtocolVersion::V5 {
         let mut properties = Vec::new();
+        if let Some(payload_format_indicator) = publication.payload_format_indicator {
+            properties.push(PROP_PAYLOAD_FORMAT_INDICATOR as u8);
+            properties.push(payload_format_indicator);
+        }
         if let Some(response_topic) = &publication.response_topic {
             properties.push(PROP_RESPONSE_TOPIC as u8);
             write_utf8(response_topic, &mut properties);
@@ -662,8 +670,15 @@ struct Cursor<'a> {
 }
 
 #[derive(Debug, Default)]
+struct ConnectProperties {
+    session_expiry_interval: Option<u32>,
+    maximum_packet_size: Option<u32>,
+}
+
+#[derive(Debug, Default)]
 struct PublishProperties {
     topic_alias: Option<u16>,
+    payload_format_indicator: Option<u8>,
     response_topic: Option<String>,
     correlation_data: Option<Vec<u8>>,
     subscription_identifiers: Vec<u32>,
@@ -747,6 +762,35 @@ impl<'a> Cursor<'a> {
         Ok(())
     }
 
+    fn read_connect_properties(&mut self) -> Result<ConnectProperties, ProtocolError> {
+        let len = self.read_varint()? as usize;
+        if self.remaining() < len {
+            return Err(ProtocolError::MalformedPacket("truncated properties"));
+        }
+        let end = self.pos + len;
+        let mut properties = ConnectProperties::default();
+        while self.pos < end {
+            let identifier = self.read_varint()?;
+            match identifier {
+                PROP_SESSION_EXPIRY_INTERVAL => {
+                    properties.session_expiry_interval = Some(self.read_u32()?);
+                }
+                PROP_MAXIMUM_PACKET_SIZE => {
+                    let value = self.read_u32()?;
+                    if value == 0 {
+                        return Err(ProtocolError::MalformedPacket("zero maximum packet size"));
+                    }
+                    properties.maximum_packet_size = Some(value);
+                }
+                _ => self.skip_property_value(identifier)?,
+            }
+        }
+        if self.pos != end {
+            return Err(ProtocolError::MalformedPacket("property length mismatch"));
+        }
+        Ok(properties)
+    }
+
     fn read_session_expiry_property(&mut self) -> Result<Option<u32>, ProtocolError> {
         let len = self.read_varint()? as usize;
         if self.remaining() < len {
@@ -810,6 +854,9 @@ impl<'a> Cursor<'a> {
         while self.pos < end {
             let identifier = self.read_varint()?;
             match identifier {
+                PROP_PAYLOAD_FORMAT_INDICATOR => {
+                    properties.payload_format_indicator = Some(self.read_u8()?);
+                }
                 PROP_TOPIC_ALIAS => {
                     properties.topic_alias = Some(self.read_u16()?);
                 }
@@ -1112,12 +1159,38 @@ mod tests {
                 packet_id: Some(0x1234),
                 dup: true,
                 topic_alias: None,
+                payload_format_indicator: None,
                 response_topic: None,
                 correlation_data: None,
                 subscription_identifiers: Vec::new(),
             },
         );
         assert_eq!(encoded, vec![0x3A, 6, 0, 1, b'a', 0x12, 0x34, b'p']);
+    }
+
+    #[test]
+    fn decodes_mqtt_v5_connect_maximum_packet_size() {
+        let body = [
+            0, 4, b'M', b'Q', b'T', b'T', 5, 2, 0, 60, 5, 0x27, 0, 0, 0, 40, 0, 6, b'c', b'l',
+            b'i', b'e', b'n', b't',
+        ];
+        let packet = decode_frame(
+            &Frame {
+                command: CMD_CONNECT,
+                flags: 0,
+                body: body.to_vec(),
+            },
+            None,
+        )
+        .unwrap();
+
+        match packet {
+            MqttPacket::Connect {
+                maximum_packet_size,
+                ..
+            } => assert_eq!(maximum_packet_size, Some(40)),
+            other => panic!("unexpected packet: {other:?}"),
+        }
     }
 
     #[test]
@@ -1171,6 +1244,7 @@ mod tests {
                 packet_id: None,
                 dup: false,
                 topic_alias: None,
+                payload_format_indicator: None,
                 response_topic: None,
                 correlation_data: None,
                 subscription_identifiers: vec![321],
@@ -1206,11 +1280,15 @@ mod tests {
                 packet_id: None,
                 dup: false,
                 topic_alias: None,
+                payload_format_indicator: Some(1),
                 response_topic: Some("response/topic".to_owned()),
                 correlation_data: Some(b"corr".to_vec()),
                 subscription_identifiers: Vec::new(),
             },
         );
+        assert!(encoded
+            .windows(2)
+            .any(|window| { window == [PROP_PAYLOAD_FORMAT_INDICATOR as u8, 1] }));
         assert!(encoded.windows(17).any(|window| {
             window
                 == [

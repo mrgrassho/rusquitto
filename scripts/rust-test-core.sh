@@ -48,4 +48,6 @@ export BUILD_ROOT="$test_root"
     python3 12-prop-response-topic.py
     python3 12-prop-response-topic-correlation-data.py
     python3 12-prop-maximum-packet-size-broker.py
+    python3 12-prop-maximum-packet-size-publish-qos1.py
+    python3 12-prop-maximum-packet-size-publish-qos2.py
 )
