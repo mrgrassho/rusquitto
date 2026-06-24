@@ -71,6 +71,7 @@ struct Settings {
     retain_available: bool,
     upgrade_outgoing_qos: bool,
     auto_id_prefix: Option<String>,
+    accept_protocol_versions: Option<Vec<ProtocolVersion>>,
     persistence_db_file: Option<String>,
     max_keepalive: Option<u16>,
     max_packet_size: Option<u32>,
@@ -133,6 +134,7 @@ impl Default for Settings {
             retain_available: true,
             upgrade_outgoing_qos: false,
             auto_id_prefix: None,
+            accept_protocol_versions: None,
             persistence_db_file: None,
             max_keepalive: None,
             max_packet_size: None,
@@ -409,6 +411,16 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
                         settings.auto_id_prefix = Some(value.to_owned());
                     }
                 }
+                "accept_protocol_versions" => {
+                    if let Some(value) = value {
+                        let mut values = value.to_owned();
+                        for part in parts {
+                            values.push(' ');
+                            values.push_str(part);
+                        }
+                        settings.accept_protocol_versions = parse_protocol_versions(&values);
+                    }
+                }
                 "listener_allow_anonymous" => {
                     if let Some(value) = parse_bool(value) {
                         if let Some(listener) = listener_drafts.last_mut() {
@@ -511,6 +523,32 @@ fn parse_bool(value: Option<&str>) -> Option<bool> {
         Some("true") | Some("1") => Some(true),
         Some("false") | Some("0") => Some(false),
         _ => None,
+    }
+}
+
+fn parse_protocol_versions(value: &str) -> Option<Vec<ProtocolVersion>> {
+    let versions = value
+        .split(',')
+        .filter_map(|part| match part.trim() {
+            "3" => Some(ProtocolVersion::V31),
+            "4" => Some(ProtocolVersion::V311),
+            "5" => Some(ProtocolVersion::V5),
+            "" => None,
+            _ => None,
+        })
+        .fold(Vec::new(), |mut versions, version| {
+            if !versions.contains(&version) {
+                versions.push(version);
+            }
+            versions
+        });
+    (!versions.is_empty()).then_some(versions)
+}
+
+fn protocol_accepted(accepted: Option<&[ProtocolVersion]>, protocol: ProtocolVersion) -> bool {
+    match accepted {
+        Some(accepted) => accepted.contains(&protocol),
+        None => true,
     }
 }
 
@@ -1421,6 +1459,16 @@ fn handle_client(
         session_expiry_interval,
         keep_alive,
     ) = connect;
+    if !protocol_accepted(settings.accept_protocol_versions.as_deref(), protocol) {
+        let rc = if protocol == ProtocolVersion::V5 {
+            0x84
+        } else {
+            1
+        };
+        stream.write_all(&encode_connack(protocol, false, rc))?;
+        return Ok(());
+    }
+
     let assigned_client_id = if client_id.is_empty() {
         if !zero_length_client_id_allowed(protocol, clean_start, allow_zero_length_clientid) {
             let rc = if protocol == ProtocolVersion::V5 {
@@ -2099,6 +2147,50 @@ mod tests {
                 },
             ]
         );
+
+        let _ = fs::remove_file(config);
+    }
+
+    #[test]
+    fn parses_accept_protocol_versions() {
+        assert_eq!(
+            parse_protocol_versions("    ,   3   ,    4  ,   5    "),
+            Some(vec![
+                ProtocolVersion::V31,
+                ProtocolVersion::V311,
+                ProtocolVersion::V5
+            ])
+        );
+        assert_eq!(
+            parse_protocol_versions("5,4,3"),
+            Some(vec![
+                ProtocolVersion::V5,
+                ProtocolVersion::V311,
+                ProtocolVersion::V31
+            ])
+        );
+        assert_eq!(parse_protocol_versions(",,,"), None);
+    }
+
+    #[test]
+    fn parse_settings_records_accept_protocol_versions() {
+        let config = write_temp_config("listener 18889\naccept_protocol_versions 3,5\n");
+
+        let settings =
+            parse_settings(vec!["-c".to_owned(), config.clone()]).expect("settings should parse");
+
+        assert_eq!(
+            settings.accept_protocol_versions,
+            Some(vec![ProtocolVersion::V31, ProtocolVersion::V5])
+        );
+        assert!(protocol_accepted(
+            settings.accept_protocol_versions.as_deref(),
+            ProtocolVersion::V31
+        ));
+        assert!(!protocol_accepted(
+            settings.accept_protocol_versions.as_deref(),
+            ProtocolVersion::V311
+        ));
 
         let _ = fs::remove_file(config);
     }
