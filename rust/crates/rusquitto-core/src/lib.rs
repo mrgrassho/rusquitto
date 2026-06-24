@@ -594,6 +594,7 @@ impl BrokerState {
         if !Self::valid_publication(&publication) {
             return PublishResult {
                 accepted: false,
+                matched_subscribers: false,
                 deliveries: Vec::new(),
             };
         }
@@ -655,6 +656,8 @@ impl BrokerState {
             *cursor = (*cursor + 1) % candidates.len();
         }
 
+        let matched_subscribers = !delivery_specs.is_empty();
+
         for spec in delivery_specs {
             let mut outgoing = publication.clone();
             outgoing.qos = spec.qos;
@@ -682,6 +685,7 @@ impl BrokerState {
 
         PublishResult {
             accepted: true,
+            matched_subscribers,
             deliveries,
         }
     }
@@ -817,6 +821,7 @@ pub struct SubscribeResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishResult {
     pub accepted: bool,
+    pub matched_subscribers: bool,
     pub deliveries: Vec<Delivery>,
 }
 
@@ -873,8 +878,48 @@ mod tests {
         );
         let result = broker.publish("pub", publication("a/b/c", false));
         assert!(result.accepted);
+        assert!(result.matched_subscribers);
         assert_eq!(result.deliveries.len(), 1);
         assert_eq!(result.deliveries[0].client_id, "sub");
+    }
+
+    #[test]
+    fn reports_when_publish_matches_no_subscribers() {
+        let mut broker = BrokerState::new();
+        broker.connect("pub".into(), true, None, 0);
+
+        let result = broker.publish("pub", publication("no/subscribers", false));
+
+        assert!(result.accepted);
+        assert!(!result.matched_subscribers);
+        assert!(result.deliveries.is_empty());
+    }
+
+    #[test]
+    fn offline_durable_subscriber_counts_as_publish_match() {
+        let mut broker = BrokerState::new();
+        broker.connect("sub".into(), false, None, 60);
+        broker.subscribe(
+            "sub",
+            vec![SubscriptionRequest {
+                filter: "offline/match".into(),
+                qos: 1,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+                identifier: None,
+            }],
+        );
+        broker.disconnect("sub", true, None);
+
+        let mut publication = publication("offline/match", false);
+        publication.qos = 1;
+        let result = broker.publish("pub", publication);
+
+        assert!(result.accepted);
+        assert!(result.matched_subscribers);
+        assert!(result.deliveries.is_empty());
+        assert_eq!(broker.clients["sub"].queued.len(), 1);
     }
 
     #[test]

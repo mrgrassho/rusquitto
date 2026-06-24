@@ -599,6 +599,10 @@ pub fn encode_puback(protocol: ProtocolVersion, packet_id: u16) -> Vec<u8> {
     encode_ack(CMD_PUBACK, 0, protocol, packet_id)
 }
 
+pub fn encode_puback_reason(protocol: ProtocolVersion, packet_id: u16, reason_code: u8) -> Vec<u8> {
+    encode_ack_reason(CMD_PUBACK, 0, protocol, packet_id, reason_code)
+}
+
 pub fn encode_pubrec(protocol: ProtocolVersion, packet_id: u16) -> Vec<u8> {
     encode_ack(CMD_PUBREC, 0, protocol, packet_id)
 }
@@ -616,6 +620,21 @@ pub fn encode_pubcomp(protocol: ProtocolVersion, packet_id: u16) -> Vec<u8> {
 fn encode_ack(command: u8, flags: u8, _protocol: ProtocolVersion, packet_id: u16) -> Vec<u8> {
     let mut body = Vec::new();
     write_u16(packet_id, &mut body);
+    encode_frame(command, flags, &body)
+}
+
+fn encode_ack_reason(
+    command: u8,
+    flags: u8,
+    protocol: ProtocolVersion,
+    packet_id: u16,
+    reason_code: u8,
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    write_u16(packet_id, &mut body);
+    if protocol == ProtocolVersion::V5 {
+        body.push(reason_code);
+    }
     encode_frame(command, flags, &body)
 }
 
@@ -1265,6 +1284,18 @@ mod tests {
         assert_eq!(
             encode_pubrel(ProtocolVersion::V5, 0x1234),
             vec![0x62, 2, 0x12, 0x34]
+        );
+    }
+
+    #[test]
+    fn encodes_mqtt5_puback_reason_code() {
+        assert_eq!(
+            encode_puback_reason(ProtocolVersion::V5, 0x1234, 0x10),
+            vec![0x40, 0x03, 0x12, 0x34, 0x10]
+        );
+        assert_eq!(
+            encode_puback_reason(ProtocolVersion::V311, 0x1234, 0x10),
+            vec![0x40, 0x02, 0x12, 0x34]
         );
     }
 

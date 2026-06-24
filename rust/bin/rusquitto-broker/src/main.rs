@@ -16,11 +16,12 @@ use rusquitto_core::{
 };
 use rusquitto_protocol::{
     decode_frame, encode_connack, encode_connack_with_options, encode_disconnect, encode_pingresp,
-    encode_puback, encode_pubcomp, encode_publish, encode_pubrec, encode_pubrel, encode_suback,
-    encode_unsuback, read_frame, topic, ConnackOptions, Frame, MqttPacket, ProtocolVersion,
-    Publication,
+    encode_puback, encode_puback_reason, encode_pubcomp, encode_publish, encode_pubrec,
+    encode_pubrel, encode_suback, encode_unsuback, read_frame, topic, ConnackOptions, Frame,
+    MqttPacket, ProtocolVersion, Publication,
 };
 
+const MQTT_RC_NO_MATCHING_SUBSCRIBERS: u8 = 0x10;
 const MQTT_RC_MALFORMED_PACKET: u8 = 0x81;
 const MQTT_RC_PROTOCOL_ERROR: u8 = 0x82;
 const MQTT_RC_NOT_AUTHORIZED: u8 = 0x87;
@@ -1660,9 +1661,14 @@ fn handle_client(
                             }
                             break;
                         }
+                        let matched_subscribers = result.matched_subscribers;
                         send_deliveries(&shared_acl, &client_users, &outbound, result.deliveries);
                         if let Some(packet_id) = packet_id {
-                            let _ = tx.send(encode_puback(protocol, packet_id));
+                            let _ = tx.send(encode_qos1_puback(
+                                protocol,
+                                packet_id,
+                                matched_subscribers,
+                            ));
                         }
                     }
                     2 => {
@@ -1839,6 +1845,18 @@ fn handle_client(
         .disconnect(&client_id, false, None);
     send_deliveries(&shared_acl, &client_users, &outbound, deliveries);
     Ok(())
+}
+
+fn encode_qos1_puback(
+    protocol: ProtocolVersion,
+    packet_id: u16,
+    matched_subscribers: bool,
+) -> Vec<u8> {
+    if protocol == ProtocolVersion::V5 && !matched_subscribers {
+        encode_puback_reason(protocol, packet_id, MQTT_RC_NO_MATCHING_SUBSCRIBERS)
+    } else {
+        encode_puback(protocol, packet_id)
+    }
 }
 
 fn resolve_topic_alias(
@@ -2050,6 +2068,22 @@ mod tests {
             correlation_data: None,
             subscription_identifiers: subscription_identifier.into_iter().collect(),
         }
+    }
+
+    #[test]
+    fn mqtt5_qos1_puback_reports_no_matching_subscribers() {
+        assert_eq!(
+            encode_qos1_puback(ProtocolVersion::V5, 0x1234, false),
+            vec![0x40, 0x03, 0x12, 0x34, MQTT_RC_NO_MATCHING_SUBSCRIBERS]
+        );
+        assert_eq!(
+            encode_qos1_puback(ProtocolVersion::V5, 0x1234, true),
+            vec![0x40, 0x02, 0x12, 0x34]
+        );
+        assert_eq!(
+            encode_qos1_puback(ProtocolVersion::V311, 0x1234, false),
+            vec![0x40, 0x02, 0x12, 0x34]
+        );
     }
 
     fn sqlite_scalar(path: &str, sql: &str) -> String {
