@@ -15,9 +15,9 @@ use rusquitto_core::{
     BrokerState, PersistedSession, Qos2Outbound, Qos2OutboundState, Subscription,
 };
 use rusquitto_protocol::{
-    decode_frame, encode_connack, encode_connack_with_assigned_client_id, encode_disconnect,
-    encode_pingresp, encode_puback, encode_pubcomp, encode_publish, encode_pubrec, encode_pubrel,
-    encode_suback, encode_unsuback, read_frame, topic, MqttPacket, ProtocolVersion, Publication,
+    decode_frame, encode_connack, encode_connack_with_options, encode_disconnect, encode_pingresp,
+    encode_puback, encode_pubcomp, encode_publish, encode_pubrec, encode_pubrel, encode_suback,
+    encode_unsuback, read_frame, topic, ConnackOptions, MqttPacket, ProtocolVersion, Publication,
 };
 
 const MQTT_RC_MALFORMED_PACKET: u8 = 0x81;
@@ -65,6 +65,7 @@ struct Settings {
     retain_available: bool,
     upgrade_outgoing_qos: bool,
     persistence_db_file: Option<String>,
+    max_keepalive: Option<u16>,
     password_file: Option<HashMap<String, PasswordEntry>>,
     acl_file: Option<AclFile>,
     acl_file_path: Option<String>,
@@ -122,6 +123,7 @@ impl Default for Settings {
             retain_available: true,
             upgrade_outgoing_qos: false,
             persistence_db_file: None,
+            max_keepalive: None,
             password_file: None,
             acl_file: None,
             acl_file_path: None,
@@ -413,6 +415,11 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
                 "plugin_opt_db_file" => {
                     if let Some(value) = value {
                         settings.persistence_db_file = Some(value.to_owned());
+                    }
+                }
+                "max_keepalive" => {
+                    if let Some(value) = value.and_then(|value| value.parse::<u16>().ok()) {
+                        settings.max_keepalive = Some(value);
                     }
                 }
                 "password_file" => {
@@ -1330,6 +1337,7 @@ fn handle_client(
             password,
             will,
             session_expiry_interval,
+            keep_alive,
             ..
         }) => (
             protocol,
@@ -1339,6 +1347,7 @@ fn handle_client(
             password,
             will,
             session_expiry_interval,
+            keep_alive,
         ),
         _ => return Ok(()),
     };
@@ -1351,6 +1360,7 @@ fn handle_client(
         password,
         mut will,
         session_expiry_interval,
+        keep_alive,
     ) = connect;
     let assigned_client_id = if client_id.is_empty() {
         client_id = auto_client_id();
@@ -1388,12 +1398,19 @@ fn handle_client(
         will,
         broker_session_expiry_interval,
     );
-    stream.write_all(&encode_connack_with_assigned_client_id(
+    let server_keep_alive = settings
+        .max_keepalive
+        .filter(|max_keepalive| keep_alive > *max_keepalive);
+    stream.write_all(&encode_connack_with_options(
         protocol,
         connect_result.session_present,
         0,
-        settings.retain_available,
-        assigned_client_id.as_deref(),
+        ConnackOptions {
+            retain_available: settings.retain_available,
+            assigned_client_id: assigned_client_id.as_deref(),
+            server_keep_alive,
+            ..ConnackOptions::default()
+        },
     ))?;
 
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
@@ -2019,6 +2036,18 @@ mod tests {
                 mount_point: None,
             }]
         );
+
+        let _ = fs::remove_file(config);
+    }
+
+    #[test]
+    fn parse_settings_reads_max_keepalive() {
+        let config = write_temp_config("listener 18886\nmax_keepalive 60\n");
+
+        let settings =
+            parse_settings(vec!["-c".to_owned(), config.clone()]).expect("settings should parse");
+
+        assert_eq!(settings.max_keepalive, Some(60));
 
         let _ = fs::remove_file(config);
     }

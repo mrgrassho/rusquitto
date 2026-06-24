@@ -428,7 +428,31 @@ pub fn encode_connack(
     session_present: bool,
     reason_code: u8,
 ) -> Vec<u8> {
-    encode_connack_with_retain_available(protocol, session_present, reason_code, true)
+    encode_connack_with_options(
+        protocol,
+        session_present,
+        reason_code,
+        ConnackOptions::default(),
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ConnackOptions<'a> {
+    pub retain_available: bool,
+    pub assigned_client_id: Option<&'a str>,
+    pub server_keep_alive: Option<u16>,
+    pub maximum_packet_size: u32,
+}
+
+impl Default for ConnackOptions<'_> {
+    fn default() -> Self {
+        Self {
+            retain_available: true,
+            assigned_client_id: None,
+            server_keep_alive: None,
+            maximum_packet_size: 2_000_000,
+        }
+    }
 }
 
 pub fn encode_connack_with_retain_available(
@@ -437,12 +461,14 @@ pub fn encode_connack_with_retain_available(
     reason_code: u8,
     retain_available: bool,
 ) -> Vec<u8> {
-    encode_connack_with_properties(
+    encode_connack_with_options(
         protocol,
         session_present,
         reason_code,
-        retain_available,
-        None,
+        ConnackOptions {
+            retain_available,
+            ..ConnackOptions::default()
+        },
     )
 }
 
@@ -453,38 +479,44 @@ pub fn encode_connack_with_assigned_client_id(
     retain_available: bool,
     assigned_client_id: Option<&str>,
 ) -> Vec<u8> {
-    encode_connack_with_properties(
+    encode_connack_with_options(
         protocol,
         session_present,
         reason_code,
-        retain_available,
-        assigned_client_id,
+        ConnackOptions {
+            retain_available,
+            assigned_client_id,
+            ..ConnackOptions::default()
+        },
     )
 }
 
-fn encode_connack_with_properties(
+pub fn encode_connack_with_options(
     protocol: ProtocolVersion,
     session_present: bool,
     reason_code: u8,
-    retain_available: bool,
-    assigned_client_id: Option<&str>,
+    options: ConnackOptions<'_>,
 ) -> Vec<u8> {
     let mut body = vec![u8::from(session_present), reason_code];
     if protocol == ProtocolVersion::V5 {
         if reason_code == 0 {
             let mut properties = Vec::new();
+            if let Some(keep_alive) = options.server_keep_alive {
+                properties.push(PROP_SERVER_KEEP_ALIVE as u8);
+                write_u16(keep_alive, &mut properties);
+            }
             properties.push(PROP_TOPIC_ALIAS_MAXIMUM as u8);
             write_u16(10, &mut properties);
-            if let Some(client_id) = assigned_client_id {
+            if let Some(client_id) = options.assigned_client_id {
                 properties.push(PROP_ASSIGNED_CLIENT_IDENTIFIER as u8);
                 write_utf8(client_id, &mut properties);
             }
-            if !retain_available {
+            if !options.retain_available {
                 properties.push(PROP_RETAIN_AVAILABLE as u8);
                 properties.push(0);
             }
             properties.push(PROP_MAXIMUM_PACKET_SIZE as u8);
-            write_u32(2_000_000, &mut properties);
+            write_u32(options.maximum_packet_size, &mut properties);
             properties.push(PROP_RECEIVE_MAXIMUM as u8);
             write_u16(20, &mut properties);
             write_varint(properties.len() as u32, &mut body);
@@ -875,6 +907,25 @@ mod tests {
             vec![
                 0x20, 26, 0, 0, 23, 0x22, 0, 10, 0x12, 0, 9, b'a', b'u', b't', b'o', b'-', b't',
                 b'e', b's', b't', 0x27, 0, 0x1E, 0x84, 0x80, 0x21, 0, 20,
+            ]
+        );
+    }
+
+    #[test]
+    fn encodes_mqtt_v5_server_keep_alive() {
+        assert_eq!(
+            encode_connack_with_options(
+                ProtocolVersion::V5,
+                false,
+                0,
+                ConnackOptions {
+                    server_keep_alive: Some(60),
+                    ..ConnackOptions::default()
+                },
+            ),
+            vec![
+                0x20, 17, 0, 0, 14, 0x13, 0, 60, 0x22, 0, 10, 0x27, 0, 0x1E, 0x84, 0x80, 0x21, 0,
+                20,
             ]
         );
     }
