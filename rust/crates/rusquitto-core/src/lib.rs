@@ -21,6 +21,8 @@ pub struct PersistedSession {
     pub session_expiry_interval: u32,
     pub subscriptions: Vec<Subscription>,
     pub queued: Vec<Publication>,
+    pub inflight_qos1: Vec<Publication>,
+    pub inflight_qos2: Vec<Qos2Outbound>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,11 +136,32 @@ impl BrokerState {
                 .filter_map(Self::valid_queued_publication)
                 .inspect(|publication| {
                     if let Some(packet_id) = publication.packet_id {
-                        max_packet_id =
-                            Some(max_packet_id.map_or(packet_id, |max| max.max(packet_id)));
+                        Self::record_packet_id(&mut max_packet_id, packet_id);
                     }
                 })
                 .collect();
+
+            let mut inflight_qos1 = BTreeMap::new();
+            for publication in session.inflight_qos1 {
+                let Some(publication) = Self::valid_inflight_publication(publication, 1) else {
+                    continue;
+                };
+                let packet_id = publication.packet_id.expect("validated packet id");
+                Self::record_packet_id(&mut max_packet_id, packet_id);
+                inflight_qos1.insert(packet_id, publication);
+            }
+
+            let mut inflight_qos2 = BTreeMap::new();
+            for mut outbound in session.inflight_qos2 {
+                let Some(publication) = Self::valid_inflight_publication(outbound.publication, 2)
+                else {
+                    continue;
+                };
+                let packet_id = publication.packet_id.expect("validated packet id");
+                Self::record_packet_id(&mut max_packet_id, packet_id);
+                outbound.publication = publication;
+                inflight_qos2.insert(packet_id, outbound);
+            }
 
             self.clients.insert(
                 session.client_id.clone(),
@@ -147,8 +170,8 @@ impl BrokerState {
                     subscriptions,
                     will: None,
                     queued,
-                    inflight_qos1: BTreeMap::new(),
-                    inflight_qos2: BTreeMap::new(),
+                    inflight_qos1,
+                    inflight_qos2,
                     inbound_qos2: BTreeMap::new(),
                     session_expiry_interval: session.session_expiry_interval,
                     disconnected_at: None,
@@ -189,11 +212,25 @@ impl BrokerState {
                     })
                     .cloned()
                     .collect();
+                let inflight_qos1 = session
+                    .inflight_qos1
+                    .values()
+                    .filter(|publication| Self::valid_publication(publication))
+                    .cloned()
+                    .collect();
+                let inflight_qos2 = session
+                    .inflight_qos2
+                    .values()
+                    .filter(|outbound| Self::valid_publication(&outbound.publication))
+                    .cloned()
+                    .collect();
                 PersistedSession {
                     client_id: session.client_id.clone(),
                     session_expiry_interval: session.session_expiry_interval,
                     subscriptions,
                     queued,
+                    inflight_qos1,
+                    inflight_qos2,
                 }
             })
             .collect();
@@ -237,21 +274,16 @@ impl BrokerState {
             .clients
             .get_mut(&client_id)
             .map(|session| {
-                let mut pending: Vec<_> = session
-                    .inflight_qos1
-                    .values()
-                    .cloned()
-                    .map(|mut publication| {
-                        publication.dup = true;
-                        publication
-                    })
-                    .collect();
+                let mut pending = Vec::new();
+                for publication in session.inflight_qos1.values_mut() {
+                    publication.dup = true;
+                    pending.push(publication.clone());
+                }
 
-                pending.extend(session.inflight_qos2.values().filter_map(|outbound| {
+                pending.extend(session.inflight_qos2.values_mut().filter_map(|outbound| {
                     if outbound.state == Qos2OutboundState::WaitingPubRec {
-                        let mut publication = outbound.publication.clone();
-                        publication.dup = true;
-                        Some(publication)
+                        outbound.publication.dup = true;
+                        Some(outbound.publication.clone())
                     } else {
                         None
                     }
@@ -656,6 +688,27 @@ impl BrokerState {
             .subscription_identifiers
             .retain(|identifier| *identifier > 0);
         Some(publication)
+    }
+
+    fn valid_inflight_publication(
+        mut publication: Publication,
+        expected_qos: u8,
+    ) -> Option<Publication> {
+        if publication.qos != expected_qos
+            || publication.packet_id.is_none()
+            || !Self::valid_publication(&publication)
+        {
+            return None;
+        }
+        publication.topic_alias = None;
+        publication
+            .subscription_identifiers
+            .retain(|identifier| *identifier > 0);
+        Some(publication)
+    }
+
+    fn record_packet_id(max_packet_id: &mut Option<u16>, packet_id: u16) {
+        *max_packet_id = Some(max_packet_id.map_or(packet_id, |max| max.max(packet_id)));
     }
 
     fn delivery_qos(&self, publish_qos: u8, subscription_qos: u8) -> u8 {
@@ -1383,6 +1436,8 @@ mod tests {
                 order: 99,
             }],
             queued: Vec::new(),
+            inflight_qos1: Vec::new(),
+            inflight_qos2: Vec::new(),
         }]);
 
         let mut queued = publication("persist/topic", false);
@@ -1444,6 +1499,88 @@ mod tests {
         let reconnect = restored.connect("durable".into(), false, None, 60);
         assert_eq!(reconnect.queued.len(), 1);
         assert_eq!(reconnect.queued[0].packet_id, Some(2));
+    }
+
+    #[test]
+    fn snapshots_and_restores_outbound_qos1_inflight_for_persistence() {
+        let mut broker = BrokerState::new();
+        broker.connect("sub".into(), false, None, 60);
+        broker.subscribe(
+            "sub",
+            vec![SubscriptionRequest {
+                filter: "persist/qos1".into(),
+                qos: 1,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+                identifier: None,
+            }],
+        );
+
+        let mut publication = publication("persist/qos1", false);
+        publication.qos = 1;
+        let result = broker.publish("pub", publication);
+        let packet_id = result.deliveries[0].publication.packet_id.unwrap();
+
+        let snapshot = broker.session_snapshot();
+        assert_eq!(snapshot[0].inflight_qos1.len(), 1);
+
+        let mut restored = BrokerState::new();
+        restored.restore_sessions(snapshot);
+        let reconnect = restored.connect("sub".into(), false, None, 60);
+        assert!(reconnect.session_present);
+        assert_eq!(reconnect.queued.len(), 1);
+        assert_eq!(reconnect.queued[0].packet_id, Some(packet_id));
+        assert!(reconnect.queued[0].dup);
+    }
+
+    #[test]
+    fn snapshots_and_restores_outbound_qos2_inflight_for_persistence() {
+        let mut broker = BrokerState::new();
+        broker.connect("sub".into(), false, None, 60);
+        broker.subscribe(
+            "sub",
+            vec![SubscriptionRequest {
+                filter: "persist/qos2".into(),
+                qos: 2,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+                identifier: None,
+            }],
+        );
+
+        let mut publication = publication("persist/qos2", false);
+        publication.qos = 2;
+        let result = broker.publish("pub", publication);
+        let packet_id = result.deliveries[0].publication.packet_id.unwrap();
+
+        let snapshot = broker.session_snapshot();
+        assert_eq!(snapshot[0].inflight_qos2.len(), 1);
+        assert_eq!(
+            snapshot[0].inflight_qos2[0].state,
+            Qos2OutboundState::WaitingPubRec
+        );
+
+        let mut restored = BrokerState::new();
+        restored.restore_sessions(snapshot);
+        let reconnect = restored.connect("sub".into(), false, None, 60);
+        assert_eq!(reconnect.queued.len(), 1);
+        assert_eq!(reconnect.queued[0].packet_id, Some(packet_id));
+        assert!(reconnect.queued[0].dup);
+
+        assert!(restored.pubrec("sub", packet_id));
+        let snapshot = restored.session_snapshot();
+        assert_eq!(
+            snapshot[0].inflight_qos2[0].state,
+            Qos2OutboundState::WaitingPubComp
+        );
+
+        let mut restored = BrokerState::new();
+        restored.restore_sessions(snapshot);
+        let reconnect = restored.connect("sub".into(), false, None, 60);
+        assert!(reconnect.queued.is_empty());
+        assert_eq!(reconnect.pubrels, vec![packet_id]);
     }
 
     #[test]

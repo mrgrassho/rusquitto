@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use rusquitto_core::{BrokerState, PersistedSession, Subscription};
+use rusquitto_core::{
+    BrokerState, PersistedSession, Qos2Outbound, Qos2OutboundState, Subscription,
+};
 use rusquitto_protocol::{
     decode_frame, encode_connack, encode_connack_with_retain_available, encode_disconnect,
     encode_pingresp, encode_puback, encode_pubcomp, encode_publish, encode_pubrec, encode_pubrel,
@@ -363,6 +365,8 @@ mod sqlite_persistence {
                     session_expiry_interval,
                     subscriptions: Vec::new(),
                     queued: Vec::new(),
+                    inflight_qos1: Vec::new(),
+                    inflight_qos2: Vec::new(),
                 });
             }
 
@@ -389,29 +393,29 @@ mod sqlite_persistence {
         if let Some(session) = current {
             sessions.push(session);
         }
-        load_queued_messages(path, &mut sessions)?;
+        load_client_messages(path, &mut sessions)?;
         Ok(sessions)
     }
 
-    fn load_queued_messages(path: &str, sessions: &mut [PersistedSession]) -> Result<(), String> {
+    fn load_client_messages(path: &str, sessions: &mut [PersistedSession]) -> Result<(), String> {
         let output = Command::new("sqlite3")
             .arg("-batch")
             .arg("-separator")
             .arg("\t")
             .arg(path)
             .arg(
-                "SELECT cm.client_id, cm.mid, cm.qos, cm.retain, cm.dup, \
+                "SELECT cm.client_id, cm.mid, cm.qos, cm.retain, cm.dup, cm.state, \
                         COALESCE(cm.subscription_identifier, 0), b.topic, \
                         hex(COALESCE(b.payload, X'')) \
                  FROM client_msgs cm JOIN base_msgs b ON cm.store_id = b.store_id \
-                 WHERE cm.direction = 1 AND cm.state = 11 \
+                 WHERE cm.direction = 1 AND cm.state IN (3, 5, 9, 11) \
                  ORDER BY cm.client_id, cm.cmsg_id;",
             )
             .output()
             .map_err(|e| format!("unable to run sqlite3: {e}"))?;
         if !output.status.success() {
             return Err(format!(
-                "unable to load queued persistence: {}",
+                "unable to load client message persistence: {}",
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
@@ -439,13 +443,17 @@ mod sqlite_persistence {
                 .unwrap_or(0);
             let retain = parts.next().is_some_and(|value| value == "1");
             let dup = parts.next().is_some_and(|value| value == "1");
+            let state = parts
+                .next()
+                .and_then(|value| value.parse::<u8>().ok())
+                .unwrap_or(0);
             let subscription_identifier = parts
                 .next()
                 .and_then(|value| value.parse::<u32>().ok())
                 .filter(|identifier| *identifier > 0);
             let topic = parts.next().unwrap_or_default();
             let payload_hex = parts.next().unwrap_or_default();
-            sessions[session_idx].queued.push(Publication {
+            let publication = Publication {
                 topic: topic.to_owned(),
                 payload: decode_hex(payload_hex)?,
                 qos,
@@ -454,7 +462,20 @@ mod sqlite_persistence {
                 dup,
                 topic_alias: None,
                 subscription_identifiers: subscription_identifier.into_iter().collect(),
-            });
+            };
+            match state {
+                11 => sessions[session_idx].queued.push(publication),
+                3 => sessions[session_idx].inflight_qos1.push(publication),
+                5 => sessions[session_idx].inflight_qos2.push(Qos2Outbound {
+                    publication,
+                    state: Qos2OutboundState::WaitingPubRec,
+                }),
+                9 => sessions[session_idx].inflight_qos2.push(Qos2Outbound {
+                    publication,
+                    state: Qos2OutboundState::WaitingPubComp,
+                }),
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -505,26 +526,38 @@ mod sqlite_persistence {
             }
             let mut client_msg_id = 1_i64;
             for publication in &session.queued {
-                let Some(packet_id) = publication.packet_id else {
-                    continue;
+                append_persisted_client_msg(
+                    &mut sql,
+                    &session.client_id,
+                    &mut store_id,
+                    &mut client_msg_id,
+                    publication,
+                    11,
+                );
+            }
+            for publication in &session.inflight_qos1 {
+                append_persisted_client_msg(
+                    &mut sql,
+                    &session.client_id,
+                    &mut store_id,
+                    &mut client_msg_id,
+                    publication,
+                    3,
+                );
+            }
+            for outbound in &session.inflight_qos2 {
+                let state = match outbound.state {
+                    Qos2OutboundState::WaitingPubRec => 5,
+                    Qos2OutboundState::WaitingPubComp => 9,
                 };
-                if publication.qos == 0 {
-                    continue;
-                }
-                append_base_msg(&mut sql, store_id, publication, publication.retain);
-                sql.push_str(&format!(
-                    "INSERT INTO client_msgs(client_id,cmsg_id,store_id,dup,direction,mid,qos,retain,state,subscription_identifier) VALUES ('{}',{},{},{},1,{},{},{},11,{});\n",
-                    escape_sql(&session.client_id),
-                    client_msg_id,
-                    store_id,
-                    u8::from(publication.dup),
-                    packet_id,
-                    publication.qos,
-                    u8::from(publication.retain),
-                    publication.subscription_identifiers.first().copied().unwrap_or(0),
-                ));
-                store_id += 1;
-                client_msg_id += 1;
+                append_persisted_client_msg(
+                    &mut sql,
+                    &session.client_id,
+                    &mut store_id,
+                    &mut client_msg_id,
+                    &outbound.publication,
+                    state,
+                );
             }
         }
         for publication in retained {
@@ -573,6 +606,37 @@ mod sqlite_persistence {
             publication.qos,
             u8::from(retain),
         ));
+    }
+
+    fn append_persisted_client_msg(
+        sql: &mut String,
+        client_id: &str,
+        store_id: &mut i64,
+        client_msg_id: &mut i64,
+        publication: &Publication,
+        state: u8,
+    ) {
+        let Some(packet_id) = publication.packet_id else {
+            return;
+        };
+        if publication.qos == 0 {
+            return;
+        }
+        append_base_msg(sql, *store_id, publication, publication.retain);
+        sql.push_str(&format!(
+            "INSERT INTO client_msgs(client_id,cmsg_id,store_id,dup,direction,mid,qos,retain,state,subscription_identifier) VALUES ('{}',{},{},{},1,{},{},{},{},{});\n",
+            escape_sql(client_id),
+            *client_msg_id,
+            *store_id,
+            u8::from(publication.dup),
+            packet_id,
+            publication.qos,
+            u8::from(publication.retain),
+            state,
+            publication.subscription_identifiers.first().copied().unwrap_or(0),
+        ));
+        *store_id += 1;
+        *client_msg_id += 1;
     }
 
     fn append_schema(sql: &mut String) {
@@ -1130,6 +1194,8 @@ mod tests {
                 queued_publication("queue/one", b"message-one", 1, 4, Some(12)),
                 queued_publication("queue/two", b"message-two", 2, 5, None),
             ],
+            inflight_qos1: Vec::new(),
+            inflight_qos2: Vec::new(),
         }];
         sqlite_persistence::save(&db_path, &[], &sessions).expect("queue save should work");
 
@@ -1174,6 +1240,76 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_persistence_round_trips_outbound_inflight_messages() {
+        let dir = env::temp_dir().join(format!("rusquitto-inflight-test-{}", unique_id()));
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let db = dir.join("mosquitto.sqlite3");
+        let db_path = db.to_string_lossy().to_string();
+
+        let mut qos2_wait_pubrec =
+            queued_publication("inflight/qos2/pubrec", b"qos2-a", 2, 8, Some(31));
+        qos2_wait_pubrec.dup = true;
+        let qos2_wait_pubcomp = queued_publication("inflight/qos2/pubcomp", b"qos2-b", 2, 9, None);
+        let sessions = vec![PersistedSession {
+            client_id: "inflight-client".into(),
+            session_expiry_interval: 60,
+            subscriptions: Vec::new(),
+            queued: Vec::new(),
+            inflight_qos1: vec![queued_publication("inflight/qos1", b"qos1", 1, 7, Some(30))],
+            inflight_qos2: vec![
+                Qos2Outbound {
+                    publication: qos2_wait_pubrec,
+                    state: Qos2OutboundState::WaitingPubRec,
+                },
+                Qos2Outbound {
+                    publication: qos2_wait_pubcomp,
+                    state: Qos2OutboundState::WaitingPubComp,
+                },
+            ],
+        }];
+        sqlite_persistence::save(&db_path, &[], &sessions).expect("inflight save should work");
+
+        assert_eq!(
+            sqlite_scalar(&db_path, "SELECT COUNT(*) FROM base_msgs;"),
+            "3"
+        );
+        assert_eq!(
+            sqlite_scalar(
+                &db_path,
+                "SELECT cmsg_id || ':' || store_id || ':' || mid || ':' || qos || ':' || dup || ':' || state || ':' || subscription_identifier FROM client_msgs ORDER BY cmsg_id;",
+            ),
+            "1:1:7:1:0:3:30\n2:2:8:2:1:5:31\n3:3:9:2:0:9:0"
+        );
+
+        let loaded =
+            sqlite_persistence::load_sessions(&db_path).expect("inflight load should work");
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].queued.is_empty());
+        assert_eq!(loaded[0].inflight_qos1.len(), 1);
+        assert_eq!(loaded[0].inflight_qos1[0].topic, "inflight/qos1");
+        assert_eq!(loaded[0].inflight_qos1[0].packet_id, Some(7));
+        assert_eq!(
+            loaded[0].inflight_qos1[0].subscription_identifiers,
+            vec![30]
+        );
+        assert_eq!(loaded[0].inflight_qos2.len(), 2);
+        assert_eq!(
+            loaded[0].inflight_qos2[0].state,
+            Qos2OutboundState::WaitingPubRec
+        );
+        assert!(loaded[0].inflight_qos2[0].publication.dup);
+        assert_eq!(
+            loaded[0].inflight_qos2[1].state,
+            Qos2OutboundState::WaitingPubComp
+        );
+
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(format!("{}-wal", db_path));
+        let _ = fs::remove_file(format!("{}-shm", db_path));
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
     fn sqlite_persistence_round_trips_durable_sessions_and_subscriptions() {
         let dir = env::temp_dir().join(format!("rusquitto-session-test-{}", unique_id()));
         fs::create_dir_all(&dir).expect("temp dir should be created");
@@ -1193,6 +1329,8 @@ mod tests {
                 order: 9,
             }],
             queued: Vec::new(),
+            inflight_qos1: Vec::new(),
+            inflight_qos2: Vec::new(),
         }];
         sqlite_persistence::save(&db_path, &[], &sessions).expect("session save should work");
 
@@ -1225,6 +1363,8 @@ mod tests {
         assert_eq!(loaded[0].session_expiry_interval, u32::MAX);
         assert_eq!(loaded[0].subscriptions.len(), 1);
         assert!(loaded[0].queued.is_empty());
+        assert!(loaded[0].inflight_qos1.is_empty());
+        assert!(loaded[0].inflight_qos2.is_empty());
         let subscription = &loaded[0].subscriptions[0];
         assert_eq!(subscription.filter, "persist/#");
         assert_eq!(subscription.qos, 1);
