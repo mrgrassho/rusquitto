@@ -38,4 +38,5 @@ export BUILD_ROOT="$test_root"
     python3 09-acl-empty-file.py
     python3 09-acl-access-variants.py
     python3 09-acl-change.py
+    python3 10-listener-mount-point.py
 )

@@ -5,6 +5,7 @@ use std::io::{self, ErrorKind, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -24,6 +25,7 @@ const MQTT_RC_PROTOCOL_ERROR: u8 = 0x82;
 const MQTT_RC_NOT_AUTHORIZED: u8 = 0x87;
 const MQTT_RC_RETAIN_NOT_SUPPORTED: u8 = 0x9A;
 const UNKNOWN_SCHEMA_VERSION_PREFIX: &str = "Unknown database_schema version ";
+static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 type OutboundMap = Arc<Mutex<HashMap<String, ClientOutbound>>>;
 type ClientUsers = Arc<Mutex<HashMap<String, Option<String>>>>;
@@ -34,12 +36,14 @@ type SharedBroker = Arc<Mutex<BrokerState>>;
 struct ListenerSettings {
     port: u16,
     allow_anonymous: bool,
+    mount_point: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 struct ListenerDraft {
     port: u16,
     allow_anonymous: Option<bool>,
+    mount_point: Option<String>,
 }
 
 struct BoundListener {
@@ -50,6 +54,7 @@ struct BoundListener {
 #[derive(Debug, Clone)]
 struct ClientOutbound {
     protocol: ProtocolVersion,
+    mount_point: Option<String>,
     sender: Sender<Vec<u8>>,
 }
 
@@ -111,6 +116,7 @@ impl Default for Settings {
             listeners: vec![ListenerSettings {
                 port: 1883,
                 allow_anonymous: true,
+                mount_point: None,
             }],
             verbose: false,
             retain_available: true,
@@ -190,7 +196,7 @@ fn run() -> Result<(), String> {
                     let client_users = Arc::clone(&client_users);
                     let shared_acl = Arc::clone(&shared_acl);
                     let settings = settings.clone();
-                    let allow_anonymous = listener.settings.allow_anonymous;
+                    let listener_settings = listener.settings.clone();
                     thread::spawn(move || {
                         if let Err(err) = handle_client(
                             stream,
@@ -199,7 +205,7 @@ fn run() -> Result<(), String> {
                             client_users,
                             shared_acl,
                             settings,
-                            allow_anonymous,
+                            listener_settings,
                         ) {
                             eprintln!("Client error: {err}");
                         }
@@ -360,6 +366,7 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
                             listener_drafts.push(ListenerDraft {
                                 port,
                                 allow_anonymous: None,
+                                mount_point: None,
                             });
                         }
                     }
@@ -371,6 +378,7 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
                             listener_drafts.push(ListenerDraft {
                                 port,
                                 allow_anonymous: None,
+                                mount_point: None,
                             });
                         }
                     }
@@ -385,6 +393,11 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
                         } else {
                             default_listener_allow = Some(value);
                         }
+                    }
+                }
+                "mount_point" => {
+                    if let (Some(listener), Some(value)) = (listener_drafts.last_mut(), value) {
+                        listener.mount_point = Some(value.to_owned());
                     }
                 }
                 "retain_available" => {
@@ -421,6 +434,7 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
         listener_drafts.push(ListenerDraft {
             port: cli_port.unwrap_or(1883),
             allow_anonymous: default_listener_allow,
+            mount_point: None,
         });
     }
     let default_allow_anonymous = explicit_allow.unwrap_or(!config_declared_listener);
@@ -429,6 +443,7 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
         .map(|listener| ListenerSettings {
             port: listener.port,
             allow_anonymous: listener.allow_anonymous.unwrap_or(default_allow_anonymous),
+            mount_point: listener.mount_point,
         })
         .collect();
     if let Some(path) = password_file_path {
@@ -1298,8 +1313,10 @@ fn handle_client(
     client_users: ClientUsers,
     shared_acl: SharedAcl,
     settings: Settings,
-    allow_anonymous: bool,
+    listener_settings: ListenerSettings,
 ) -> io::Result<()> {
+    let allow_anonymous = listener_settings.allow_anonymous;
+    let mount_point = listener_settings.mount_point;
     let first = match read_frame(&mut stream) {
         Ok(frame) => frame,
         Err(_) => return Ok(()),
@@ -1326,10 +1343,20 @@ fn handle_client(
         _ => return Ok(()),
     };
 
-    let (protocol, clean_start, mut client_id, username, password, will, session_expiry_interval) =
-        connect;
+    let (
+        protocol,
+        clean_start,
+        mut client_id,
+        username,
+        password,
+        mut will,
+        session_expiry_interval,
+    ) = connect;
     if client_id.is_empty() {
         client_id = format!("auto-{}", unique_id());
+    }
+    if let Some(will) = will.as_mut() {
+        apply_mount_point_to_topic(&mut will.topic, mount_point.as_deref());
     }
     if !connection_authorized(
         allow_anonymous,
@@ -1370,6 +1397,7 @@ fn handle_client(
         client_id.clone(),
         ClientOutbound {
             protocol,
+            mount_point: mount_point.clone(),
             sender: tx.clone(),
         },
     );
@@ -1391,7 +1419,16 @@ fn handle_client(
             AclOperation::Read,
             &publication.topic,
         ) {
-            let _ = tx.send(encode_publish(protocol, &publication));
+            if let Some(outgoing) =
+                mounted_outbound_publication(&publication, mount_point.as_deref())
+            {
+                let _ = tx.send(encode_publish(protocol, &outgoing));
+            } else if let Some(packet_id) = publication.packet_id {
+                broker
+                    .lock()
+                    .expect("broker lock poisoned")
+                    .drop_outgoing(&client_id, packet_id);
+            }
         } else if let Some(packet_id) = publication.packet_id {
             broker
                 .lock()
@@ -1429,6 +1466,7 @@ fn handle_client(
                     }
                     break;
                 }
+                apply_mount_point_to_topic(&mut publication.topic, mount_point.as_deref());
                 if !acl_allows(
                     &shared_acl,
                     username.as_deref(),
@@ -1575,7 +1613,11 @@ fn handle_client(
                     .expect("broker lock poisoned")
                     .pubcomp(&client_id, packet_id);
             }
-            MqttPacket::Subscribe { packet_id, filters } => {
+            MqttPacket::Subscribe {
+                packet_id,
+                mut filters,
+            } => {
+                apply_mount_point_to_subscription_filters(&mut filters, mount_point.as_deref());
                 let result = broker
                     .lock()
                     .expect("broker lock poisoned")
@@ -1589,7 +1631,11 @@ fn handle_client(
                 let _ = tx.send(encode_suback(protocol, packet_id, &result.reason_codes));
                 send_deliveries(&shared_acl, &client_users, &outbound, result.retained);
             }
-            MqttPacket::Unsubscribe { packet_id, filters } => {
+            MqttPacket::Unsubscribe {
+                packet_id,
+                mut filters,
+            } => {
+                apply_mount_point_to_unsubscribe_filters(&mut filters, mount_point.as_deref());
                 broker
                     .lock()
                     .expect("broker lock poisoned")
@@ -1658,6 +1704,57 @@ fn resolve_topic_alias(
     }
 }
 
+fn apply_mount_point_to_topic(topic: &mut String, mount_point: Option<&str>) {
+    let Some(mount_point) = mount_point.filter(|mount_point| !mount_point.is_empty()) else {
+        return;
+    };
+    topic.insert_str(0, mount_point);
+}
+
+fn apply_mount_point_to_subscription_filters(
+    filters: &mut [rusquitto_protocol::SubscriptionRequest],
+    mount_point: Option<&str>,
+) {
+    let Some(mount_point) = mount_point.filter(|mount_point| !mount_point.is_empty()) else {
+        return;
+    };
+    for filter in filters {
+        filter.filter = mounted_filter(&filter.filter, mount_point);
+    }
+}
+
+fn apply_mount_point_to_unsubscribe_filters(filters: &mut [String], mount_point: Option<&str>) {
+    let Some(mount_point) = mount_point.filter(|mount_point| !mount_point.is_empty()) else {
+        return;
+    };
+    for filter in filters {
+        *filter = mounted_filter(filter, mount_point);
+    }
+}
+
+fn mounted_filter(filter: &str, mount_point: &str) -> String {
+    let Some(rest) = filter.strip_prefix("$share/") else {
+        return format!("{mount_point}{filter}");
+    };
+    let Some((group, shared_filter)) = rest.split_once('/') else {
+        return format!("{mount_point}{filter}");
+    };
+    format!("$share/{group}/{mount_point}{shared_filter}")
+}
+
+fn mounted_outbound_publication(
+    publication: &Publication,
+    mount_point: Option<&str>,
+) -> Option<Publication> {
+    let Some(mount_point) = mount_point.filter(|mount_point| !mount_point.is_empty()) else {
+        return Some(publication.clone());
+    };
+    let mut outgoing = publication.clone();
+    let topic = outgoing.topic.strip_prefix(mount_point)?.to_owned();
+    outgoing.topic = topic;
+    Some(outgoing)
+}
+
 fn send_deliveries(
     shared_acl: &SharedAcl,
     client_users: &ClientUsers,
@@ -1680,19 +1777,27 @@ fn send_deliveries(
             continue;
         }
         if let Some(client) = map.get(&delivery.client_id) {
-            let _ = client
-                .sender
-                .send(encode_publish(client.protocol, &delivery.publication));
+            if let Some(publication) =
+                mounted_outbound_publication(&delivery.publication, client.mount_point.as_deref())
+            {
+                let _ = client
+                    .sender
+                    .send(encode_publish(client.protocol, &publication));
+            }
         }
     }
 }
 
 fn unique_id() -> u128 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
-        .unwrap_or(0)
+        .unwrap_or(0);
+    let counter = UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed) as u128;
+    nanos
+        .saturating_mul(1_000_000)
+        .saturating_add(counter % 1_000_000)
 }
 
 #[cfg(test)]
@@ -1789,15 +1894,63 @@ mod tests {
                 ListenerSettings {
                     port: 18881,
                     allow_anonymous: true,
+                    mount_point: None,
                 },
                 ListenerSettings {
                     port: 18882,
                     allow_anonymous: false,
+                    mount_point: None,
                 },
             ]
         );
 
         let _ = fs::remove_file(config);
+    }
+
+    #[test]
+    fn parse_settings_records_listener_mount_points() {
+        let config = write_temp_config(
+            "listener 18881\nlistener_allow_anonymous true\nlistener 18882\nmount_point mount/\nallow_anonymous true\n",
+        );
+
+        let settings =
+            parse_settings(vec!["-c".to_owned(), config.clone()]).expect("settings should parse");
+
+        assert_eq!(
+            settings.listeners,
+            vec![
+                ListenerSettings {
+                    port: 18881,
+                    allow_anonymous: true,
+                    mount_point: None,
+                },
+                ListenerSettings {
+                    port: 18882,
+                    allow_anonymous: true,
+                    mount_point: Some("mount/".to_owned()),
+                },
+            ]
+        );
+
+        let _ = fs::remove_file(config);
+    }
+
+    #[test]
+    fn mount_point_rewrites_subscription_filters_and_outbound_topics() {
+        let mut topic = "sensor/value".to_owned();
+        apply_mount_point_to_topic(&mut topic, Some("mount/"));
+        assert_eq!(topic, "mount/sensor/value");
+        assert_eq!(mounted_filter("#", "mount/"), "mount/#");
+        assert_eq!(
+            mounted_filter("$share/group/sensor/#", "mount/"),
+            "$share/group/mount/sensor/#"
+        );
+
+        let publication = retained_publication("mount/sensor/value", b"payload", 0);
+        let outgoing = mounted_outbound_publication(&publication, Some("mount/"))
+            .expect("mounted publication should be visible");
+        assert_eq!(outgoing.topic, "sensor/value");
+        assert!(mounted_outbound_publication(&publication, Some("other/")).is_none());
     }
 
     #[test]
@@ -1817,6 +1970,7 @@ mod tests {
             vec![ListenerSettings {
                 port: 18883,
                 allow_anonymous: false,
+                mount_point: None,
             }]
         );
 
@@ -1835,6 +1989,7 @@ mod tests {
             vec![ListenerSettings {
                 port: 18884,
                 allow_anonymous: false,
+                mount_point: None,
             }]
         );
 
