@@ -28,6 +28,23 @@ const UNKNOWN_SCHEMA_VERSION_PREFIX: &str = "Unknown database_schema version ";
 type OutboundMap = Arc<Mutex<HashMap<String, ClientOutbound>>>;
 type SharedBroker = Arc<Mutex<BrokerState>>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListenerSettings {
+    port: u16,
+    allow_anonymous: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ListenerDraft {
+    port: u16,
+    allow_anonymous: Option<bool>,
+}
+
+struct BoundListener {
+    settings: ListenerSettings,
+    listener: TcpListener,
+}
+
 #[derive(Debug, Clone)]
 struct ClientOutbound {
     protocol: ProtocolVersion,
@@ -36,9 +53,8 @@ struct ClientOutbound {
 
 #[derive(Debug, Clone)]
 struct Settings {
-    port: u16,
+    listeners: Vec<ListenerSettings>,
     verbose: bool,
-    allow_anonymous: bool,
     retain_available: bool,
     upgrade_outgoing_qos: bool,
     persistence_db_file: Option<String>,
@@ -47,9 +63,11 @@ struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            port: 1883,
+            listeners: vec![ListenerSettings {
+                port: 1883,
+                allow_anonymous: true,
+            }],
             verbose: false,
-            allow_anonymous: true,
             retain_available: true,
             upgrade_outgoing_qos: false,
             persistence_db_file: None,
@@ -74,14 +92,24 @@ fn exit_code_for_error(err: &str) -> i32 {
 
 fn run() -> Result<(), String> {
     let settings = parse_settings(env::args().skip(1).collect())?;
-    let listener = bind_listener(settings.port)?;
+    let listeners = bind_listeners(&settings.listeners)?;
     if settings.verbose {
         eprintln!("rusquitto version 2.1.2 starting");
-        eprintln!("Opening ipv4 listen socket on port {}.", settings.port);
+        for listener in &listeners {
+            eprintln!(
+                "Opening ipv4 listen socket on port {}.",
+                listener.settings.port
+            );
+        }
     }
 
     shutdown::install();
-    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+    for listener in &listeners {
+        listener
+            .listener
+            .set_nonblocking(true)
+            .map_err(|e| e.to_string())?;
+    }
 
     let mut broker_state = BrokerState::new();
     broker_state.set_upgrade_outgoing_qos(settings.upgrade_outgoing_qos);
@@ -95,28 +123,36 @@ fn run() -> Result<(), String> {
     let broker = Arc::new(Mutex::new(broker_state));
     let outbound = Arc::new(Mutex::new(HashMap::new()));
     while !shutdown::requested() {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                if let Err(err) = stream.set_nonblocking(false) {
-                    eprintln!("Client setup error: {err}");
-                    continue;
-                }
-                let broker = Arc::clone(&broker);
-                let outbound = Arc::clone(&outbound);
-                let settings = settings.clone();
-                thread::spawn(move || {
-                    if let Err(err) = handle_client(stream, broker, outbound, settings) {
-                        eprintln!("Client error: {err}");
+        let mut accepted = false;
+        for listener in &listeners {
+            match listener.listener.accept() {
+                Ok((stream, _)) => {
+                    accepted = true;
+                    if let Err(err) = stream.set_nonblocking(false) {
+                        eprintln!("Client setup error: {err}");
+                        continue;
                     }
-                });
+                    let broker = Arc::clone(&broker);
+                    let outbound = Arc::clone(&outbound);
+                    let settings = settings.clone();
+                    let allow_anonymous = listener.settings.allow_anonymous;
+                    thread::spawn(move || {
+                        if let Err(err) =
+                            handle_client(stream, broker, outbound, settings, allow_anonymous)
+                        {
+                            eprintln!("Client error: {err}");
+                        }
+                    });
+                }
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+                Err(err) if err.kind() == ErrorKind::Interrupted => {}
+                Err(err) => {
+                    eprintln!("Accept error: {err}");
+                }
             }
-            Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(25));
-            }
-            Err(err) if err.kind() == ErrorKind::Interrupted => {}
-            Err(err) => {
-                eprintln!("Accept error: {err}");
-            }
+        }
+        if !accepted {
+            thread::sleep(Duration::from_millis(25));
         }
     }
     if let Some(path) = settings.persistence_db_file.as_deref() {
@@ -166,10 +202,17 @@ mod shutdown {
     }
 }
 
-fn bind_listener(port: u16) -> Result<TcpListener, String> {
-    TcpListener::bind(("::", port))
-        .or_else(|_| TcpListener::bind(("0.0.0.0", port)))
-        .map_err(|e| e.to_string())
+fn bind_listeners(settings: &[ListenerSettings]) -> Result<Vec<BoundListener>, String> {
+    settings
+        .iter()
+        .cloned()
+        .map(|settings| {
+            TcpListener::bind(("::", settings.port))
+                .or_else(|_| TcpListener::bind(("0.0.0.0", settings.port)))
+                .map(|listener| BoundListener { settings, listener })
+                .map_err(|e| e.to_string())
+        })
+        .collect()
 }
 
 fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
@@ -204,7 +247,8 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
 
     let mut config_declared_listener = false;
     let mut explicit_allow = None;
-    let mut listener_allow = None;
+    let mut listener_drafts = Vec::new();
+    let mut default_listener_allow = None;
     if let Some(path) = config_path {
         let contents =
             fs::read_to_string(&path).map_err(|e| format!("unable to read config {path}: {e}"))?;
@@ -217,11 +261,26 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
             let key = parts.next().unwrap_or("");
             let value = parts.next();
             match key {
-                "port" | "listener" => {
+                "port" => {
                     config_declared_listener = true;
                     if let Some(value) = value {
                         if let Ok(port) = value.parse::<u16>() {
-                            settings.port = port;
+                            listener_drafts.clear();
+                            listener_drafts.push(ListenerDraft {
+                                port,
+                                allow_anonymous: None,
+                            });
+                        }
+                    }
+                }
+                "listener" => {
+                    config_declared_listener = true;
+                    if let Some(value) = value {
+                        if let Ok(port) = value.parse::<u16>() {
+                            listener_drafts.push(ListenerDraft {
+                                port,
+                                allow_anonymous: None,
+                            });
                         }
                     }
                 }
@@ -229,7 +288,13 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
                     explicit_allow = parse_bool(value);
                 }
                 "listener_allow_anonymous" => {
-                    listener_allow = parse_bool(value);
+                    if let Some(value) = parse_bool(value) {
+                        if let Some(listener) = listener_drafts.last_mut() {
+                            listener.allow_anonymous = Some(value);
+                        } else {
+                            default_listener_allow = Some(value);
+                        }
+                    }
                 }
                 "retain_available" => {
                     if let Some(value) = parse_bool(value) {
@@ -251,16 +316,20 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
         }
     }
 
-    if let Some(port) = cli_port {
-        settings.port = port;
+    if listener_drafts.is_empty() {
+        listener_drafts.push(ListenerDraft {
+            port: cli_port.unwrap_or(1883),
+            allow_anonymous: default_listener_allow,
+        });
     }
-    settings.allow_anonymous = if let Some(value) = listener_allow {
-        value
-    } else if let Some(value) = explicit_allow {
-        value
-    } else {
-        !config_declared_listener
-    };
+    let default_allow_anonymous = explicit_allow.unwrap_or(!config_declared_listener);
+    settings.listeners = listener_drafts
+        .into_iter()
+        .map(|listener| ListenerSettings {
+            port: listener.port,
+            allow_anonymous: listener.allow_anonymous.unwrap_or(default_allow_anonymous),
+        })
+        .collect();
 
     Ok(settings)
 }
@@ -831,6 +900,7 @@ fn handle_client(
     broker: SharedBroker,
     outbound: OutboundMap,
     settings: Settings,
+    allow_anonymous: bool,
 ) -> io::Result<()> {
     let first = match read_frame(&mut stream) {
         Ok(frame) => frame,
@@ -860,7 +930,7 @@ fn handle_client(
     if client_id.is_empty() {
         client_id = format!("auto-{}", unique_id());
     }
-    if !settings.allow_anonymous && username.is_none() {
+    if !allow_anonymous && username.is_none() {
         let rc = if protocol == ProtocolVersion::V5 {
             MQTT_RC_NOT_AUTHORIZED
         } else {
@@ -1224,6 +1294,84 @@ mod tests {
             "sqlite3 failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn write_temp_config(contents: &str) -> String {
+        let path = env::temp_dir().join(format!("rusquitto-config-test-{}.conf", unique_id()));
+        fs::write(&path, contents).expect("temp config should be written");
+        path.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn parse_settings_keeps_configured_listeners_when_cli_port_is_present() {
+        let config = write_temp_config(
+            "listener 18881\nlistener_allow_anonymous true\nlistener 18882\nlistener_allow_anonymous false\nallow_anonymous true\n",
+        );
+
+        let settings = parse_settings(vec![
+            "-c".to_owned(),
+            config.clone(),
+            "-p".to_owned(),
+            "18881".to_owned(),
+        ])
+        .expect("settings should parse");
+
+        assert_eq!(
+            settings.listeners,
+            vec![
+                ListenerSettings {
+                    port: 18881,
+                    allow_anonymous: true,
+                },
+                ListenerSettings {
+                    port: 18882,
+                    allow_anonymous: false,
+                },
+            ]
+        );
+
+        let _ = fs::remove_file(config);
+    }
+
+    #[test]
+    fn parse_settings_uses_cli_port_when_config_has_no_listener() {
+        let config = write_temp_config("max_connections 10\nallow_anonymous false\n");
+
+        let settings = parse_settings(vec![
+            "-c".to_owned(),
+            config.clone(),
+            "-p".to_owned(),
+            "18883".to_owned(),
+        ])
+        .expect("settings should parse");
+
+        assert_eq!(
+            settings.listeners,
+            vec![ListenerSettings {
+                port: 18883,
+                allow_anonymous: false,
+            }]
+        );
+
+        let _ = fs::remove_file(config);
+    }
+
+    #[test]
+    fn parse_settings_disables_anonymous_by_default_for_config_listeners() {
+        let config = write_temp_config("listener 18884\n");
+
+        let settings =
+            parse_settings(vec!["-c".to_owned(), config.clone()]).expect("settings should parse");
+
+        assert_eq!(
+            settings.listeners,
+            vec![ListenerSettings {
+                port: 18884,
+                allow_anonymous: false,
+            }]
+        );
+
+        let _ = fs::remove_file(config);
     }
 
     #[test]
