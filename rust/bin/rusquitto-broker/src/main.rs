@@ -58,6 +58,7 @@ struct Settings {
     retain_available: bool,
     upgrade_outgoing_qos: bool,
     persistence_db_file: Option<String>,
+    password_file: Option<HashMap<String, String>>,
 }
 
 impl Default for Settings {
@@ -71,6 +72,7 @@ impl Default for Settings {
             retain_available: true,
             upgrade_outgoing_qos: false,
             persistence_db_file: None,
+            password_file: None,
         }
     }
 }
@@ -249,6 +251,7 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
     let mut explicit_allow = None;
     let mut listener_drafts = Vec::new();
     let mut default_listener_allow = None;
+    let mut password_file_path = None;
     if let Some(path) = config_path {
         let contents =
             fs::read_to_string(&path).map_err(|e| format!("unable to read config {path}: {e}"))?;
@@ -311,6 +314,11 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
                         settings.persistence_db_file = Some(value.to_owned());
                     }
                 }
+                "password_file" => {
+                    if let Some(value) = value {
+                        password_file_path = Some(resolve_config_path(&path, value));
+                    }
+                }
                 _ => {}
             }
         }
@@ -330,6 +338,9 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
             allow_anonymous: listener.allow_anonymous.unwrap_or(default_allow_anonymous),
         })
         .collect();
+    if let Some(path) = password_file_path {
+        settings.password_file = Some(load_password_file(&path)?);
+    }
 
     Ok(settings)
 }
@@ -340,6 +351,56 @@ fn parse_bool(value: Option<&str>) -> Option<bool> {
         Some("false") | Some("0") => Some(false),
         _ => None,
     }
+}
+
+fn resolve_config_path(config_path: &str, value: &str) -> String {
+    let value_path = Path::new(value);
+    if value_path.is_absolute() {
+        return value.to_owned();
+    }
+    Path::new(config_path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.join(value).to_string_lossy().to_string())
+        .unwrap_or_else(|| value.to_owned())
+}
+
+fn load_password_file(path: &str) -> Result<HashMap<String, String>, String> {
+    let contents = fs::read_to_string(path)
+        .map_err(|e| format!("unable to read password_file {path}: {e}"))?;
+    let mut entries = HashMap::new();
+    for raw_line in contents.lines() {
+        let line = raw_line.trim_end();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((username, password)) = line.split_once(':') else {
+            return Err(format!("invalid password_file line for {path}"));
+        };
+        entries.insert(username.to_owned(), password.to_owned());
+    }
+    Ok(entries)
+}
+
+fn connection_authorized(
+    allow_anonymous: bool,
+    password_file: Option<&HashMap<String, String>>,
+    username: Option<&str>,
+    password: Option<&[u8]>,
+) -> bool {
+    let Some(username) = username else {
+        return allow_anonymous;
+    };
+    let Some(password_file) = password_file else {
+        return true;
+    };
+    let Some(stored_password) = password_file.get(username) else {
+        return false;
+    };
+    let Some(password) = password else {
+        return false;
+    };
+    !stored_password.starts_with('$') && stored_password.as_bytes() == password
 }
 
 mod sqlite_persistence {
@@ -912,6 +973,7 @@ fn handle_client(
             clean_start,
             client_id,
             username,
+            password,
             will,
             session_expiry_interval,
             ..
@@ -920,17 +982,24 @@ fn handle_client(
             clean_start,
             client_id,
             username,
+            password,
             will,
             session_expiry_interval,
         ),
         _ => return Ok(()),
     };
 
-    let (protocol, clean_start, mut client_id, username, will, session_expiry_interval) = connect;
+    let (protocol, clean_start, mut client_id, username, password, will, session_expiry_interval) =
+        connect;
     if client_id.is_empty() {
         client_id = format!("auto-{}", unique_id());
     }
-    if !allow_anonymous && username.is_none() {
+    if !connection_authorized(
+        allow_anonymous,
+        settings.password_file.as_ref(),
+        username.as_deref(),
+        password.as_deref(),
+    ) {
         let rc = if protocol == ProtocolVersion::V5 {
             MQTT_RC_NOT_AUTHORIZED
         } else {
@@ -1372,6 +1441,65 @@ mod tests {
         );
 
         let _ = fs::remove_file(config);
+    }
+
+    #[test]
+    fn parse_settings_loads_password_file_relative_to_config() {
+        let dir = env::temp_dir().join(format!("rusquitto-password-test-{}", unique_id()));
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let password_file = dir.join("passwords");
+        let config = dir.join("mosquitto.conf");
+        fs::write(&password_file, "user:password\n").expect("password file should be written");
+        fs::write(&config, "listener 18885\npassword_file passwords\n")
+            .expect("config should be written");
+
+        let settings = parse_settings(vec!["-c".to_owned(), config.to_string_lossy().to_string()])
+            .expect("settings should parse");
+
+        assert_eq!(
+            settings
+                .password_file
+                .as_ref()
+                .and_then(|entries| entries.get("user")),
+            Some(&"password".to_owned())
+        );
+
+        let _ = fs::remove_file(&password_file);
+        let _ = fs::remove_file(&config);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn connection_authorization_uses_plaintext_password_file_entries() {
+        let mut passwords = HashMap::new();
+        passwords.insert("user".to_owned(), "password".to_owned());
+
+        assert!(connection_authorized(
+            false,
+            Some(&passwords),
+            Some("user"),
+            Some(b"password")
+        ));
+        assert!(!connection_authorized(
+            false,
+            Some(&passwords),
+            Some("user"),
+            Some(b"wrong")
+        ));
+        assert!(!connection_authorized(
+            false,
+            Some(&passwords),
+            Some("user"),
+            None
+        ));
+        assert!(!connection_authorized(
+            false,
+            Some(&passwords),
+            Some("missing"),
+            Some(b"password")
+        ));
+        assert!(connection_authorized(true, Some(&passwords), None, None));
+        assert!(!connection_authorized(false, Some(&passwords), None, None));
     }
 
     #[test]
