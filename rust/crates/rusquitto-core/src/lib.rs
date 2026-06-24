@@ -65,7 +65,7 @@ pub struct Delivery {
 #[derive(Debug, Clone, Default)]
 pub struct BrokerState {
     clients: HashMap<String, ClientSession>,
-    retained: HashMap<String, Publication>,
+    retained: BTreeMap<String, Publication>,
     shared_cursors: HashMap<(String, String), usize>,
     next_outgoing_mid: u16,
     next_subscription_order: u64,
@@ -775,6 +775,61 @@ mod tests {
         assert_eq!(
             result.retained[0].publication.subscription_identifiers,
             vec![77]
+        );
+    }
+
+    #[test]
+    fn replays_retained_messages_in_topic_order_and_clears_deleted_topics() {
+        let mut broker = BrokerState::new();
+        broker.connect("pub".into(), true, None, 0);
+        broker.publish("pub", publication("1/2/3/4/5/6/7", true));
+        broker.publish("pub", publication("1/2/3/4", true));
+        broker.publish("pub", publication("1", true));
+
+        broker.connect("sub1".into(), true, None, 0);
+        let result = broker.subscribe(
+            "sub1",
+            vec![SubscriptionRequest {
+                filter: "#".into(),
+                qos: 0,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+                identifier: None,
+            }],
+        );
+        assert_eq!(
+            result
+                .retained
+                .iter()
+                .map(|delivery| delivery.publication.topic.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "1/2/3/4", "1/2/3/4/5/6/7"]
+        );
+
+        let mut clear = publication("1/2/3/4", true);
+        clear.payload.clear();
+        broker.publish("pub", clear);
+
+        broker.connect("sub2".into(), true, None, 0);
+        let result = broker.subscribe(
+            "sub2",
+            vec![SubscriptionRequest {
+                filter: "#".into(),
+                qos: 0,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+                identifier: None,
+            }],
+        );
+        assert_eq!(
+            result
+                .retained
+                .iter()
+                .map(|delivery| delivery.publication.topic.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "1/2/3/4/5/6/7"]
         );
     }
 
