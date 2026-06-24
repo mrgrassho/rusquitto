@@ -505,10 +505,14 @@ mod sqlite_persistence {
         sql.push_str("PRAGMA foreign_keys = ON;\n");
         sql.push_str("PRAGMA synchronous=1;\n");
         append_schema(&mut sql);
+        sql.push_str("CREATE TEMP TABLE IF NOT EXISTS rusquitto_schema_patch(patch INTEGER);\n");
+        sql.push_str("DELETE FROM rusquitto_schema_patch;\n");
+        sql.push_str("INSERT INTO rusquitto_schema_patch(patch) SELECT COALESCE((SELECT patch FROM version_info WHERE component='database_schema' AND major=1 AND minor=1 LIMIT 1), 0);\n");
         sql.push_str("BEGIN IMMEDIATE;\n");
         sql.push_str("DELETE FROM client_msgs;\n");
         sql.push_str("DELETE FROM subscriptions;\n");
         sql.push_str("DELETE FROM clients;\n");
+        sql.push_str("DELETE FROM wills;\n");
         sql.push_str("DELETE FROM retains;\n");
         sql.push_str("DELETE FROM base_msgs;\n");
         let mut store_id = 1_i64;
@@ -589,6 +593,8 @@ mod sqlite_persistence {
             ));
             store_id += 1;
         }
+        sql.push_str("DELETE FROM version_info WHERE component='database_schema';\n");
+        sql.push_str("INSERT INTO version_info(component,major,minor,patch) SELECT 'database_schema',1,1,patch FROM rusquitto_schema_patch LIMIT 1;\n");
         sql.push_str("COMMIT;\n");
         sql.push_str("PRAGMA wal_checkpoint(TRUNCATE);\n");
 
@@ -670,6 +676,8 @@ mod sqlite_persistence {
         sql.push_str("CREATE TABLE IF NOT EXISTS clients (client_id TEXT PRIMARY KEY,username TEXT,connection_time INT64,will_delay_time INT64,session_expiry_time INT64,listener_port INT,max_packet_size INT,max_qos INT,retain_available INT,session_expiry_interval INT,will_delay_interval INT);\n");
         sql.push_str("CREATE TABLE IF NOT EXISTS subscriptions (client_id TEXT NOT NULL,topic TEXT NOT NULL,subscription_options INTEGER,subscription_identifier INTEGER,PRIMARY KEY (client_id, topic) );\n");
         sql.push_str("CREATE TABLE IF NOT EXISTS client_msgs (client_id TEXT NOT NULL,cmsg_id INT64,store_id INT64,dup INTEGER,direction INTEGER,mid INTEGER,qos INTEGER,retain INTEGER,state INTEGER,subscription_identifier INTEGER);\n");
+        sql.push_str("CREATE TABLE IF NOT EXISTS wills(client_id TEXT PRIMARY KEY,payload BLOB,topic STRING NOT NULL,payloadlen INTEGER,qos INTEGER,retain INTEGER,properties STRING);\n");
+        sql.push_str("CREATE TABLE IF NOT EXISTS version_info (component TEXT NOT NULL,major INTEGER NOT NULL,minor INTEGER NOT NULL,patch INTEGER NOT NULL);\n");
     }
 
     fn subscription_from_options(
@@ -1150,6 +1158,20 @@ mod tests {
             .to_owned()
     }
 
+    fn sqlite_exec(path: &str, sql: &str) {
+        let output = Command::new("sqlite3")
+            .arg("-batch")
+            .arg(path)
+            .arg(sql)
+            .output()
+            .expect("sqlite3 should run");
+        assert!(
+            output.status.success(),
+            "sqlite3 failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn sqlite_persistence_round_trips_retained_messages() {
         let dir = env::temp_dir().join(format!("rusquitto-retained-test-{}", unique_id()));
@@ -1183,6 +1205,14 @@ mod tests {
             sqlite_scalar(&db_path, "SELECT COUNT(*) FROM client_msgs;"),
             "0"
         );
+        assert_eq!(sqlite_scalar(&db_path, "SELECT COUNT(*) FROM wills;"), "0");
+        assert_eq!(
+            sqlite_scalar(
+                &db_path,
+                "SELECT major || '.' || minor || '.' || patch FROM version_info WHERE component = 'database_schema';",
+            ),
+            "1.1.0"
+        );
 
         let loaded =
             sqlite_persistence::load_retained(&db_path).expect("retained load should work");
@@ -1195,6 +1225,34 @@ mod tests {
         assert_eq!(loaded[1].payload, b"payload-b");
         assert_eq!(loaded[1].qos, 1);
         assert!(loaded[1].retain);
+
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(format!("{}-wal", db_path));
+        let _ = fs::remove_file(format!("{}-shm", db_path));
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn sqlite_persistence_preserves_compatible_schema_patch_version() {
+        let dir = env::temp_dir().join(format!("rusquitto-version-test-{}", unique_id()));
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let db = dir.join("mosquitto.sqlite3");
+        let db_path = db.to_string_lossy().to_string();
+
+        sqlite_persistence::save(&db_path, &[], &[]).expect("initial save should work");
+        sqlite_exec(
+            &db_path,
+            "UPDATE version_info SET patch = 2 WHERE component = 'database_schema';",
+        );
+        sqlite_persistence::save(&db_path, &[], &[]).expect("resave should work");
+
+        assert_eq!(
+            sqlite_scalar(
+                &db_path,
+                "SELECT major || '.' || minor || '.' || patch FROM version_info WHERE component = 'database_schema';",
+            ),
+            "1.1.2"
+        );
 
         let _ = fs::remove_file(&db);
         let _ = fs::remove_file(format!("{}-wal", db_path));
