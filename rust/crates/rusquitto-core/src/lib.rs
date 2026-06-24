@@ -85,6 +85,24 @@ impl BrokerState {
         self.upgrade_outgoing_qos = value;
     }
 
+    pub fn restore_retained(&mut self, retained: Vec<Publication>) {
+        self.retained.clear();
+        for mut publication in retained {
+            publication.retain = true;
+            publication.packet_id = None;
+            publication.dup = false;
+            publication.topic_alias = None;
+            publication.subscription_identifiers.clear();
+            if Self::valid_publication(&publication) && !publication.payload.is_empty() {
+                self.retained.insert(publication.topic.clone(), publication);
+            }
+        }
+    }
+
+    pub fn retained_snapshot(&self) -> Vec<Publication> {
+        self.retained.values().cloned().collect()
+    }
+
     pub fn connect(
         &mut self,
         client_id: String,

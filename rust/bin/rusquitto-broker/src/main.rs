@@ -3,6 +3,8 @@ use std::env;
 use std::fs;
 use std::io::{self, ErrorKind, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
+use std::process::Command;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -36,6 +38,7 @@ struct Settings {
     allow_anonymous: bool,
     retain_available: bool,
     upgrade_outgoing_qos: bool,
+    persistence_db_file: Option<String>,
 }
 
 impl Default for Settings {
@@ -46,6 +49,7 @@ impl Default for Settings {
             allow_anonymous: true,
             retain_available: true,
             upgrade_outgoing_qos: false,
+            persistence_db_file: None,
         }
     }
 }
@@ -70,6 +74,10 @@ fn run() -> Result<(), String> {
 
     let mut broker_state = BrokerState::new();
     broker_state.set_upgrade_outgoing_qos(settings.upgrade_outgoing_qos);
+    if let Some(path) = settings.persistence_db_file.as_deref() {
+        let retained = sqlite_persistence::load_retained(path)?;
+        broker_state.restore_retained(retained);
+    }
     let broker = Arc::new(Mutex::new(broker_state));
     let outbound = Arc::new(Mutex::new(HashMap::new()));
     while !shutdown::requested() {
@@ -96,6 +104,13 @@ fn run() -> Result<(), String> {
                 eprintln!("Accept error: {err}");
             }
         }
+    }
+    if let Some(path) = settings.persistence_db_file.as_deref() {
+        let retained = broker
+            .lock()
+            .expect("broker lock poisoned")
+            .retained_snapshot();
+        sqlite_persistence::save_retained(path, &retained)?;
     }
     Ok(())
 }
@@ -212,6 +227,11 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
                         settings.upgrade_outgoing_qos = value;
                     }
                 }
+                "plugin_opt_db_file" => {
+                    if let Some(value) = value {
+                        settings.persistence_db_file = Some(value.to_owned());
+                    }
+                }
                 _ => {}
             }
         }
@@ -236,6 +256,151 @@ fn parse_bool(value: Option<&str>) -> Option<bool> {
         Some("true") | Some("1") => Some(true),
         Some("false") | Some("0") => Some(false),
         _ => None,
+    }
+}
+
+mod sqlite_persistence {
+    use super::*;
+
+    pub fn load_retained(path: &str) -> Result<Vec<Publication>, String> {
+        if !Path::new(path).exists() {
+            return Ok(Vec::new());
+        }
+        let output = Command::new("sqlite3")
+            .arg("-batch")
+            .arg("-separator")
+            .arg("\t")
+            .arg(path)
+            .arg(
+                "SELECT b.topic, hex(COALESCE(b.payload, X'')), b.qos \
+                 FROM base_msgs b JOIN retains r ON b.store_id = r.store_id \
+                 ORDER BY r.topic;",
+            )
+            .output()
+            .map_err(|e| format!("unable to run sqlite3: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "unable to load retained persistence: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        let mut retained = Vec::new();
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let mut parts = line.split('\t');
+            let Some(topic) = parts.next() else { continue };
+            let payload_hex = parts.next().unwrap_or_default();
+            let qos = parts
+                .next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            retained.push(Publication {
+                topic: topic.to_owned(),
+                payload: decode_hex(payload_hex)?,
+                qos,
+                retain: true,
+                packet_id: None,
+                dup: false,
+                topic_alias: None,
+                subscription_identifiers: Vec::new(),
+            });
+        }
+        Ok(retained)
+    }
+
+    pub fn save_retained(path: &str, retained: &[Publication]) -> Result<(), String> {
+        if let Some(parent) = Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("unable to create persistence directory: {e}"))?;
+            }
+        }
+
+        let mut sql = String::new();
+        sql.push_str("PRAGMA page_size=4096;\n");
+        sql.push_str("PRAGMA journal_mode=WAL;\n");
+        sql.push_str("PRAGMA foreign_keys = ON;\n");
+        sql.push_str("PRAGMA synchronous=1;\n");
+        sql.push_str("CREATE TABLE IF NOT EXISTS base_msgs (store_id INT64 PRIMARY KEY,expiry_time INT64,topic STRING NOT NULL,payload BLOB,source_id STRING,source_username STRING,payloadlen INTEGER,source_mid INTEGER,source_port INTEGER,qos INTEGER,retain INTEGER,properties STRING);\n");
+        sql.push_str(
+            "CREATE TABLE IF NOT EXISTS retains (topic STRING PRIMARY KEY,store_id INT64);\n",
+        );
+        sql.push_str("CREATE TABLE IF NOT EXISTS clients (client_id TEXT PRIMARY KEY,username TEXT,connection_time INT64,will_delay_time INT64,session_expiry_time INT64,listener_port INT,max_packet_size INT,max_qos INT,retain_available INT,session_expiry_interval INT,will_delay_interval INT);\n");
+        sql.push_str("CREATE TABLE IF NOT EXISTS subscriptions (client_id TEXT NOT NULL,topic TEXT NOT NULL,subscription_options INTEGER,subscription_identifier INTEGER,PRIMARY KEY (client_id, topic) );\n");
+        sql.push_str("CREATE TABLE IF NOT EXISTS client_msgs (client_id TEXT NOT NULL,cmsg_id INT64,store_id INT64,dup INTEGER,direction INTEGER,mid INTEGER,qos INTEGER,retain INTEGER,state INTEGER,subscription_identifier INTEGER);\n");
+        sql.push_str("BEGIN IMMEDIATE;\n");
+        sql.push_str("DELETE FROM client_msgs;\n");
+        sql.push_str("DELETE FROM subscriptions;\n");
+        sql.push_str("DELETE FROM clients;\n");
+        sql.push_str("DELETE FROM retains;\n");
+        sql.push_str("DELETE FROM base_msgs;\n");
+        for (idx, publication) in retained.iter().enumerate() {
+            let store_id = idx + 1;
+            sql.push_str(&format!(
+                "INSERT INTO base_msgs(store_id,expiry_time,topic,payload,source_id,source_username,payloadlen,source_mid,source_port,qos,retain,properties) VALUES ({store_id},0,'{}',X'{}','',NULL,{},0,0,{},1,NULL);\n",
+                escape_sql(&publication.topic),
+                encode_hex(&publication.payload),
+                publication.payload.len(),
+                publication.qos,
+            ));
+            sql.push_str(&format!(
+                "INSERT INTO retains(topic,store_id) VALUES ('{}',{store_id});\n",
+                escape_sql(&publication.topic)
+            ));
+        }
+        sql.push_str("COMMIT;\n");
+        sql.push_str("PRAGMA wal_checkpoint(TRUNCATE);\n");
+
+        let mut child = Command::new("sqlite3")
+            .arg("-batch")
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("unable to run sqlite3: {e}"))?;
+        child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "unable to open sqlite3 stdin".to_owned())?
+            .write_all(sql.as_bytes())
+            .map_err(|e| format!("unable to write persistence SQL: {e}"))?;
+        let output = child
+            .wait_with_output()
+            .map_err(|e| format!("unable to wait for sqlite3: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "unable to save retained persistence: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(())
+    }
+
+    fn escape_sql(value: &str) -> String {
+        value.replace('\'', "''")
+    }
+
+    fn encode_hex(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0F) as usize] as char);
+        }
+        out
+    }
+
+    fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
+        if value.len() % 2 != 0 {
+            return Err("invalid hex payload length".to_owned());
+        }
+        let mut bytes = Vec::with_capacity(value.len() / 2);
+        for chunk in value.as_bytes().chunks(2) {
+            let hex = std::str::from_utf8(chunk).map_err(|e| e.to_string())?;
+            bytes.push(u8::from_str_radix(hex, 16).map_err(|e| e.to_string())?);
+        }
+        Ok(bytes)
     }
 }
 
@@ -583,4 +748,92 @@ fn unique_id() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn retained_publication(topic: &str, payload: &[u8], qos: u8) -> Publication {
+        Publication {
+            topic: topic.to_owned(),
+            payload: payload.to_vec(),
+            qos,
+            retain: true,
+            packet_id: None,
+            dup: false,
+            topic_alias: None,
+            subscription_identifiers: Vec::new(),
+        }
+    }
+
+    fn sqlite_scalar(path: &str, sql: &str) -> String {
+        let output = Command::new("sqlite3")
+            .arg("-batch")
+            .arg(path)
+            .arg(sql)
+            .output()
+            .expect("sqlite3 should run");
+        assert!(
+            output.status.success(),
+            "sqlite3 failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("sqlite output should be utf8")
+            .trim()
+            .to_owned()
+    }
+
+    #[test]
+    fn sqlite_persistence_round_trips_retained_messages() {
+        let dir = env::temp_dir().join(format!("rusquitto-retained-test-{}", unique_id()));
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let db = dir.join("mosquitto.sqlite3");
+        let db_path = db.to_string_lossy().to_string();
+
+        let retained = vec![
+            retained_publication("b/topic", b"payload-b", 1),
+            retained_publication("a/topic", b"payload-a", 0),
+        ];
+        sqlite_persistence::save_retained(&db_path, &retained).expect("retained save should work");
+
+        assert_eq!(
+            sqlite_scalar(&db_path, "SELECT COUNT(*) FROM base_msgs;"),
+            "2"
+        );
+        assert_eq!(
+            sqlite_scalar(&db_path, "SELECT COUNT(*) FROM retains;"),
+            "2"
+        );
+        assert_eq!(
+            sqlite_scalar(&db_path, "SELECT COUNT(*) FROM clients;"),
+            "0"
+        );
+        assert_eq!(
+            sqlite_scalar(&db_path, "SELECT COUNT(*) FROM subscriptions;"),
+            "0"
+        );
+        assert_eq!(
+            sqlite_scalar(&db_path, "SELECT COUNT(*) FROM client_msgs;"),
+            "0"
+        );
+
+        let loaded =
+            sqlite_persistence::load_retained(&db_path).expect("retained load should work");
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].topic, "a/topic");
+        assert_eq!(loaded[0].payload, b"payload-a");
+        assert_eq!(loaded[0].qos, 0);
+        assert!(loaded[0].retain);
+        assert_eq!(loaded[1].topic, "b/topic");
+        assert_eq!(loaded[1].payload, b"payload-b");
+        assert_eq!(loaded[1].qos, 1);
+        assert!(loaded[1].retain);
+
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(format!("{}-wal", db_path));
+        let _ = fs::remove_file(format!("{}-shm", db_path));
+        let _ = fs::remove_dir(&dir);
+    }
 }
