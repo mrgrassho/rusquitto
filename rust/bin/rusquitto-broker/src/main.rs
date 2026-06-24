@@ -362,6 +362,7 @@ mod sqlite_persistence {
                     client_id: client_id.to_owned(),
                     session_expiry_interval,
                     subscriptions: Vec::new(),
+                    queued: Vec::new(),
                 });
             }
 
@@ -388,7 +389,74 @@ mod sqlite_persistence {
         if let Some(session) = current {
             sessions.push(session);
         }
+        load_queued_messages(path, &mut sessions)?;
         Ok(sessions)
+    }
+
+    fn load_queued_messages(path: &str, sessions: &mut [PersistedSession]) -> Result<(), String> {
+        let output = Command::new("sqlite3")
+            .arg("-batch")
+            .arg("-separator")
+            .arg("\t")
+            .arg(path)
+            .arg(
+                "SELECT cm.client_id, cm.mid, cm.qos, cm.retain, cm.dup, \
+                        COALESCE(cm.subscription_identifier, 0), b.topic, \
+                        hex(COALESCE(b.payload, X'')) \
+                 FROM client_msgs cm JOIN base_msgs b ON cm.store_id = b.store_id \
+                 WHERE cm.direction = 1 AND cm.state = 11 \
+                 ORDER BY cm.client_id, cm.cmsg_id;",
+            )
+            .output()
+            .map_err(|e| format!("unable to run sqlite3: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "unable to load queued persistence: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        let indexes: HashMap<_, _> = sessions
+            .iter()
+            .enumerate()
+            .map(|(idx, session)| (session.client_id.clone(), idx))
+            .collect();
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let mut parts = line.split('\t');
+            let Some(client_id) = parts.next() else {
+                continue;
+            };
+            let Some(session_idx) = indexes.get(client_id).copied() else {
+                continue;
+            };
+            let packet_id = parts
+                .next()
+                .and_then(|value| value.parse::<u16>().ok())
+                .filter(|packet_id| *packet_id > 0);
+            let qos = parts
+                .next()
+                .and_then(|value| value.parse::<u8>().ok())
+                .unwrap_or(0);
+            let retain = parts.next().is_some_and(|value| value == "1");
+            let dup = parts.next().is_some_and(|value| value == "1");
+            let subscription_identifier = parts
+                .next()
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|identifier| *identifier > 0);
+            let topic = parts.next().unwrap_or_default();
+            let payload_hex = parts.next().unwrap_or_default();
+            sessions[session_idx].queued.push(Publication {
+                topic: topic.to_owned(),
+                payload: decode_hex(payload_hex)?,
+                qos,
+                retain,
+                packet_id,
+                dup,
+                topic_alias: None,
+                subscription_identifiers: subscription_identifier.into_iter().collect(),
+            });
+        }
+        Ok(())
     }
 
     pub fn save(
@@ -415,6 +483,7 @@ mod sqlite_persistence {
         sql.push_str("DELETE FROM clients;\n");
         sql.push_str("DELETE FROM retains;\n");
         sql.push_str("DELETE FROM base_msgs;\n");
+        let mut store_id = 1_i64;
         for session in sessions {
             if session.client_id.is_empty() || session.session_expiry_interval == 0 {
                 continue;
@@ -434,20 +503,37 @@ mod sqlite_persistence {
                     subscription.identifier.unwrap_or(0),
                 ));
             }
+            let mut client_msg_id = 1_i64;
+            for publication in &session.queued {
+                let Some(packet_id) = publication.packet_id else {
+                    continue;
+                };
+                if publication.qos == 0 {
+                    continue;
+                }
+                append_base_msg(&mut sql, store_id, publication, publication.retain);
+                sql.push_str(&format!(
+                    "INSERT INTO client_msgs(client_id,cmsg_id,store_id,dup,direction,mid,qos,retain,state,subscription_identifier) VALUES ('{}',{},{},{},1,{},{},{},11,{});\n",
+                    escape_sql(&session.client_id),
+                    client_msg_id,
+                    store_id,
+                    u8::from(publication.dup),
+                    packet_id,
+                    publication.qos,
+                    u8::from(publication.retain),
+                    publication.subscription_identifiers.first().copied().unwrap_or(0),
+                ));
+                store_id += 1;
+                client_msg_id += 1;
+            }
         }
-        for (idx, publication) in retained.iter().enumerate() {
-            let store_id = idx + 1;
-            sql.push_str(&format!(
-                "INSERT INTO base_msgs(store_id,expiry_time,topic,payload,source_id,source_username,payloadlen,source_mid,source_port,qos,retain,properties) VALUES ({store_id},0,'{}',X'{}','',NULL,{},0,0,{},1,NULL);\n",
-                escape_sql(&publication.topic),
-                encode_hex(&publication.payload),
-                publication.payload.len(),
-                publication.qos,
-            ));
+        for publication in retained {
+            append_base_msg(&mut sql, store_id, publication, true);
             sql.push_str(&format!(
                 "INSERT INTO retains(topic,store_id) VALUES ('{}',{store_id});\n",
                 escape_sql(&publication.topic)
             ));
+            store_id += 1;
         }
         sql.push_str("COMMIT;\n");
         sql.push_str("PRAGMA wal_checkpoint(TRUNCATE);\n");
@@ -476,6 +562,17 @@ mod sqlite_persistence {
             ));
         }
         Ok(())
+    }
+
+    fn append_base_msg(sql: &mut String, store_id: i64, publication: &Publication, retain: bool) {
+        sql.push_str(&format!(
+            "INSERT INTO base_msgs(store_id,expiry_time,topic,payload,source_id,source_username,payloadlen,source_mid,source_port,qos,retain,properties) VALUES ({store_id},0,'{}',X'{}','',NULL,{},0,0,{},{},NULL);\n",
+            escape_sql(&publication.topic),
+            encode_hex(&publication.payload),
+            publication.payload.len(),
+            publication.qos,
+            u8::from(retain),
+        ));
     }
 
     fn append_schema(sql: &mut String) {
@@ -929,6 +1026,25 @@ mod tests {
         }
     }
 
+    fn queued_publication(
+        topic: &str,
+        payload: &[u8],
+        qos: u8,
+        packet_id: u16,
+        subscription_identifier: Option<u32>,
+    ) -> Publication {
+        Publication {
+            topic: topic.to_owned(),
+            payload: payload.to_vec(),
+            qos,
+            retain: false,
+            packet_id: Some(packet_id),
+            dup: false,
+            topic_alias: None,
+            subscription_identifiers: subscription_identifier.into_iter().collect(),
+        }
+    }
+
     fn sqlite_scalar(path: &str, sql: &str) -> String {
         let output = Command::new("sqlite3")
             .arg("-batch")
@@ -1000,6 +1116,64 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_persistence_round_trips_queued_messages() {
+        let dir = env::temp_dir().join(format!("rusquitto-queue-test-{}", unique_id()));
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let db = dir.join("mosquitto.sqlite3");
+        let db_path = db.to_string_lossy().to_string();
+
+        let sessions = vec![PersistedSession {
+            client_id: "queued-client".into(),
+            session_expiry_interval: 60,
+            subscriptions: Vec::new(),
+            queued: vec![
+                queued_publication("queue/one", b"message-one", 1, 4, Some(12)),
+                queued_publication("queue/two", b"message-two", 2, 5, None),
+            ],
+        }];
+        sqlite_persistence::save(&db_path, &[], &sessions).expect("queue save should work");
+
+        assert_eq!(
+            sqlite_scalar(&db_path, "SELECT COUNT(*) FROM base_msgs;"),
+            "2"
+        );
+        assert_eq!(
+            sqlite_scalar(
+                &db_path,
+                "SELECT COUNT(*) FROM client_msgs WHERE direction = 1;",
+            ),
+            "2"
+        );
+        assert_eq!(
+            sqlite_scalar(
+                &db_path,
+                "SELECT cmsg_id || ':' || store_id || ':' || mid || ':' || qos || ':' || state || ':' || subscription_identifier FROM client_msgs ORDER BY cmsg_id;",
+            ),
+            "1:1:4:1:11:12\n2:2:5:2:11:0"
+        );
+
+        let loaded = sqlite_persistence::load_sessions(&db_path).expect("queue load should work");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].client_id, "queued-client");
+        assert_eq!(loaded[0].queued.len(), 2);
+        assert_eq!(loaded[0].queued[0].topic, "queue/one");
+        assert_eq!(loaded[0].queued[0].payload, b"message-one");
+        assert_eq!(loaded[0].queued[0].qos, 1);
+        assert_eq!(loaded[0].queued[0].packet_id, Some(4));
+        assert_eq!(loaded[0].queued[0].subscription_identifiers, vec![12]);
+        assert_eq!(loaded[0].queued[1].topic, "queue/two");
+        assert_eq!(loaded[0].queued[1].payload, b"message-two");
+        assert_eq!(loaded[0].queued[1].qos, 2);
+        assert_eq!(loaded[0].queued[1].packet_id, Some(5));
+        assert!(loaded[0].queued[1].subscription_identifiers.is_empty());
+
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_file(format!("{}-wal", db_path));
+        let _ = fs::remove_file(format!("{}-shm", db_path));
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
     fn sqlite_persistence_round_trips_durable_sessions_and_subscriptions() {
         let dir = env::temp_dir().join(format!("rusquitto-session-test-{}", unique_id()));
         fs::create_dir_all(&dir).expect("temp dir should be created");
@@ -1018,6 +1192,7 @@ mod tests {
                 identifier: Some(7),
                 order: 9,
             }],
+            queued: Vec::new(),
         }];
         sqlite_persistence::save(&db_path, &[], &sessions).expect("session save should work");
 
@@ -1049,6 +1224,7 @@ mod tests {
         assert_eq!(loaded[0].client_id, "persist-client");
         assert_eq!(loaded[0].session_expiry_interval, u32::MAX);
         assert_eq!(loaded[0].subscriptions.len(), 1);
+        assert!(loaded[0].queued.is_empty());
         let subscription = &loaded[0].subscriptions[0];
         assert_eq!(subscription.filter, "persist/#");
         assert_eq!(subscription.qos, 1);
