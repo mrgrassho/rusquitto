@@ -39,6 +39,7 @@ struct ListenerSettings {
     port: u16,
     allow_anonymous: bool,
     mount_point: Option<String>,
+    auto_id_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +47,7 @@ struct ListenerDraft {
     port: u16,
     allow_anonymous: Option<bool>,
     mount_point: Option<String>,
+    auto_id_prefix: Option<String>,
 }
 
 struct BoundListener {
@@ -66,6 +68,7 @@ struct Settings {
     verbose: bool,
     retain_available: bool,
     upgrade_outgoing_qos: bool,
+    auto_id_prefix: Option<String>,
     persistence_db_file: Option<String>,
     max_keepalive: Option<u16>,
     max_packet_size: Option<u32>,
@@ -121,10 +124,12 @@ impl Default for Settings {
                 port: 1883,
                 allow_anonymous: true,
                 mount_point: None,
+                auto_id_prefix: None,
             }],
             verbose: false,
             retain_available: true,
             upgrade_outgoing_qos: false,
+            auto_id_prefix: None,
             persistence_db_file: None,
             max_keepalive: None,
             max_packet_size: None,
@@ -373,6 +378,7 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
                                 port,
                                 allow_anonymous: None,
                                 mount_point: None,
+                                auto_id_prefix: None,
                             });
                         }
                     }
@@ -385,12 +391,18 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
                                 port,
                                 allow_anonymous: None,
                                 mount_point: None,
+                                auto_id_prefix: None,
                             });
                         }
                     }
                 }
                 "allow_anonymous" => {
                     explicit_allow = parse_bool(value);
+                }
+                "auto_id_prefix" => {
+                    if let Some(value) = value {
+                        settings.auto_id_prefix = Some(value.to_owned());
+                    }
                 }
                 "listener_allow_anonymous" => {
                     if let Some(value) = parse_bool(value) {
@@ -404,6 +416,11 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
                 "mount_point" => {
                     if let (Some(listener), Some(value)) = (listener_drafts.last_mut(), value) {
                         listener.mount_point = Some(value.to_owned());
+                    }
+                }
+                "listener_auto_id_prefix" => {
+                    if let (Some(listener), Some(value)) = (listener_drafts.last_mut(), value) {
+                        listener.auto_id_prefix = Some(value.to_owned());
                     }
                 }
                 "retain_available" => {
@@ -451,6 +468,7 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
             port: cli_port.unwrap_or(1883),
             allow_anonymous: default_listener_allow,
             mount_point: None,
+            auto_id_prefix: None,
         });
     }
     let default_allow_anonymous = explicit_allow.unwrap_or(!config_declared_listener);
@@ -460,6 +478,7 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
             port: listener.port,
             allow_anonymous: listener.allow_anonymous.unwrap_or(default_allow_anonymous),
             mount_point: listener.mount_point,
+            auto_id_prefix: listener.auto_id_prefix,
         })
         .collect();
     if let Some(path) = password_file_path {
@@ -1333,6 +1352,11 @@ fn handle_client(
 ) -> io::Result<()> {
     let allow_anonymous = listener_settings.allow_anonymous;
     let mount_point = listener_settings.mount_point;
+    let auto_id_prefix = listener_settings
+        .auto_id_prefix
+        .clone()
+        .or_else(|| settings.auto_id_prefix.clone())
+        .unwrap_or_else(|| "auto-".to_owned());
     let first = match read_frame(&mut stream) {
         Ok(frame) => frame,
         Err(_) => return Ok(()),
@@ -1372,7 +1396,7 @@ fn handle_client(
         keep_alive,
     ) = connect;
     let assigned_client_id = if client_id.is_empty() {
-        client_id = auto_client_id();
+        client_id = auto_client_id(&auto_id_prefix);
         Some(client_id.clone())
     } else {
         None
@@ -1842,10 +1866,10 @@ fn send_deliveries(
     }
 }
 
-fn auto_client_id() -> String {
+fn auto_client_id(prefix: &str) -> String {
     let hex = format!("{:032x}", unique_id());
     format!(
-        "auto-{}-{}-{}-{}-{}",
+        "{prefix}{}-{}-{}-{}-{}",
         &hex[0..8],
         &hex[8..12],
         &hex[12..16],
@@ -1942,7 +1966,7 @@ mod tests {
 
     #[test]
     fn auto_client_id_uses_mosquitto_uuid_shape() {
-        let client_id = auto_client_id();
+        let client_id = auto_client_id("auto-");
         assert_eq!(client_id.len(), 41);
         assert!(client_id.starts_with("auto-"));
         assert_eq!(client_id.as_bytes()[13], b'-');
@@ -1972,11 +1996,13 @@ mod tests {
                     port: 18881,
                     allow_anonymous: true,
                     mount_point: None,
+                    auto_id_prefix: None,
                 },
                 ListenerSettings {
                     port: 18882,
                     allow_anonymous: false,
                     mount_point: None,
+                    auto_id_prefix: None,
                 },
             ]
         );
@@ -2000,16 +2026,44 @@ mod tests {
                     port: 18881,
                     allow_anonymous: true,
                     mount_point: None,
+                    auto_id_prefix: None,
                 },
                 ListenerSettings {
                     port: 18882,
                     allow_anonymous: true,
                     mount_point: Some("mount/".to_owned()),
+                    auto_id_prefix: None,
                 },
             ]
         );
 
         let _ = fs::remove_file(config);
+    }
+
+    #[test]
+    fn parse_settings_records_auto_id_prefixes() {
+        let config = write_temp_config(
+            "listener 18881\nlistener_auto_id_prefix port1-\nlistener 18882\nauto_id_prefix global-\nallow_anonymous true\n",
+        );
+
+        let settings =
+            parse_settings(vec!["-c".to_owned(), config.clone()]).expect("settings should parse");
+
+        assert_eq!(settings.auto_id_prefix, Some("global-".to_owned()));
+        assert_eq!(
+            settings.listeners[0].auto_id_prefix,
+            Some("port1-".to_owned())
+        );
+        assert_eq!(settings.listeners[1].auto_id_prefix, None);
+
+        let _ = fs::remove_file(config);
+    }
+
+    #[test]
+    fn auto_client_id_uses_configured_prefix() {
+        let client_id = auto_client_id("custom-");
+        assert_eq!(client_id.len(), 43);
+        assert!(client_id.starts_with("custom-"));
     }
 
     #[test]
@@ -2048,6 +2102,7 @@ mod tests {
                 port: 18883,
                 allow_anonymous: false,
                 mount_point: None,
+                auto_id_prefix: None,
             }]
         );
 
@@ -2067,6 +2122,7 @@ mod tests {
                 port: 18884,
                 allow_anonymous: false,
                 mount_point: None,
+                auto_id_prefix: None,
             }]
         );
 
