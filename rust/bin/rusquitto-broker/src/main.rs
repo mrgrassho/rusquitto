@@ -10,14 +10,15 @@ use std::time::Duration;
 
 use rusquitto_core::BrokerState;
 use rusquitto_protocol::{
-    decode_frame, encode_connack, encode_disconnect, encode_pingresp, encode_puback,
-    encode_pubcomp, encode_publish, encode_pubrec, encode_pubrel, encode_suback, encode_unsuback,
-    read_frame, MqttPacket, ProtocolVersion, Publication,
+    decode_frame, encode_connack, encode_connack_with_retain_available, encode_disconnect,
+    encode_pingresp, encode_puback, encode_pubcomp, encode_publish, encode_pubrec, encode_pubrel,
+    encode_suback, encode_unsuback, read_frame, MqttPacket, ProtocolVersion, Publication,
 };
 
 const MQTT_RC_MALFORMED_PACKET: u8 = 0x81;
 const MQTT_RC_PROTOCOL_ERROR: u8 = 0x82;
 const MQTT_RC_NOT_AUTHORIZED: u8 = 0x87;
+const MQTT_RC_RETAIN_NOT_SUPPORTED: u8 = 0x9A;
 
 type OutboundMap = Arc<Mutex<HashMap<String, ClientOutbound>>>;
 type SharedBroker = Arc<Mutex<BrokerState>>;
@@ -33,6 +34,8 @@ struct Settings {
     port: u16,
     verbose: bool,
     allow_anonymous: bool,
+    retain_available: bool,
+    upgrade_outgoing_qos: bool,
 }
 
 impl Default for Settings {
@@ -41,6 +44,8 @@ impl Default for Settings {
             port: 1883,
             verbose: false,
             allow_anonymous: true,
+            retain_available: true,
+            upgrade_outgoing_qos: false,
         }
     }
 }
@@ -63,7 +68,9 @@ fn run() -> Result<(), String> {
     shutdown::install();
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
 
-    let broker = Arc::new(Mutex::new(BrokerState::new()));
+    let mut broker_state = BrokerState::new();
+    broker_state.set_upgrade_outgoing_qos(settings.upgrade_outgoing_qos);
+    let broker = Arc::new(Mutex::new(broker_state));
     let outbound = Arc::new(Mutex::new(HashMap::new()));
     while !shutdown::requested() {
         match listener.accept() {
@@ -195,6 +202,16 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
                 "listener_allow_anonymous" => {
                     listener_allow = parse_bool(value);
                 }
+                "retain_available" => {
+                    if let Some(value) = parse_bool(value) {
+                        settings.retain_available = value;
+                    }
+                }
+                "upgrade_outgoing_qos" => {
+                    if let Some(value) = parse_bool(value) {
+                        settings.upgrade_outgoing_qos = value;
+                    }
+                }
                 _ => {}
             }
         }
@@ -288,7 +305,12 @@ fn handle_client(
         will,
         broker_session_expiry_interval,
     );
-    stream.write_all(&encode_connack(protocol, connect_result.session_present, 0))?;
+    stream.write_all(&encode_connack_with_retain_available(
+        protocol,
+        connect_result.session_present,
+        0,
+        settings.retain_available,
+    ))?;
 
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     outbound.lock().expect("outbound lock poisoned").insert(
@@ -329,6 +351,12 @@ fn handle_client(
 
         match packet {
             MqttPacket::Publish(mut publication) => {
+                if publication.retain && !settings.retain_available {
+                    if protocol == ProtocolVersion::V5 {
+                        let _ = tx.send(encode_disconnect(protocol, MQTT_RC_RETAIN_NOT_SUPPORTED));
+                    }
+                    break;
+                }
                 if !resolve_topic_alias(&mut publication, &mut topic_aliases) {
                     if protocol == ProtocolVersion::V5 {
                         let _ = tx.send(encode_disconnect(protocol, MQTT_RC_MALFORMED_PACKET));
