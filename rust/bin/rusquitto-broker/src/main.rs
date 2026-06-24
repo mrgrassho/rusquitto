@@ -40,6 +40,7 @@ struct ListenerSettings {
     allow_anonymous: bool,
     mount_point: Option<String>,
     auto_id_prefix: Option<String>,
+    allow_zero_length_clientid: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +49,7 @@ struct ListenerDraft {
     allow_anonymous: Option<bool>,
     mount_point: Option<String>,
     auto_id_prefix: Option<String>,
+    allow_zero_length_clientid: Option<bool>,
 }
 
 struct BoundListener {
@@ -125,6 +127,7 @@ impl Default for Settings {
                 allow_anonymous: true,
                 mount_point: None,
                 auto_id_prefix: None,
+                allow_zero_length_clientid: true,
             }],
             verbose: false,
             retain_available: true,
@@ -379,6 +382,7 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
                                 allow_anonymous: None,
                                 mount_point: None,
                                 auto_id_prefix: None,
+                                allow_zero_length_clientid: None,
                             });
                         }
                     }
@@ -392,6 +396,7 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
                                 allow_anonymous: None,
                                 mount_point: None,
                                 auto_id_prefix: None,
+                                allow_zero_length_clientid: None,
                             });
                         }
                     }
@@ -421,6 +426,13 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
                 "listener_auto_id_prefix" => {
                     if let (Some(listener), Some(value)) = (listener_drafts.last_mut(), value) {
                         listener.auto_id_prefix = Some(value.to_owned());
+                    }
+                }
+                "allow_zero_length_clientid" => {
+                    if let (Some(listener), Some(value)) =
+                        (listener_drafts.last_mut(), parse_bool(value))
+                    {
+                        listener.allow_zero_length_clientid = Some(value);
                     }
                 }
                 "retain_available" => {
@@ -469,6 +481,7 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
             allow_anonymous: default_listener_allow,
             mount_point: None,
             auto_id_prefix: None,
+            allow_zero_length_clientid: None,
         });
     }
     let default_allow_anonymous = explicit_allow.unwrap_or(!config_declared_listener);
@@ -479,6 +492,7 @@ fn parse_settings(args: Vec<String>) -> Result<Settings, String> {
             allow_anonymous: listener.allow_anonymous.unwrap_or(default_allow_anonymous),
             mount_point: listener.mount_point,
             auto_id_prefix: listener.auto_id_prefix,
+            allow_zero_length_clientid: listener.allow_zero_length_clientid.unwrap_or(true),
         })
         .collect();
     if let Some(path) = password_file_path {
@@ -1327,6 +1341,17 @@ mod sqlite_persistence {
     }
 }
 
+fn zero_length_client_id_allowed(
+    protocol: ProtocolVersion,
+    clean_start: bool,
+    allow_zero_length_clientid: bool,
+) -> bool {
+    if !allow_zero_length_clientid {
+        return false;
+    }
+    protocol == ProtocolVersion::V5 || clean_start
+}
+
 fn broker_session_expiry_interval(
     protocol: ProtocolVersion,
     clean_start: bool,
@@ -1351,6 +1376,7 @@ fn handle_client(
     listener_settings: ListenerSettings,
 ) -> io::Result<()> {
     let allow_anonymous = listener_settings.allow_anonymous;
+    let allow_zero_length_clientid = listener_settings.allow_zero_length_clientid;
     let mount_point = listener_settings.mount_point;
     let auto_id_prefix = listener_settings
         .auto_id_prefix
@@ -1396,6 +1422,15 @@ fn handle_client(
         keep_alive,
     ) = connect;
     let assigned_client_id = if client_id.is_empty() {
+        if !zero_length_client_id_allowed(protocol, clean_start, allow_zero_length_clientid) {
+            let rc = if protocol == ProtocolVersion::V5 {
+                0x80
+            } else {
+                2
+            };
+            stream.write_all(&encode_connack(protocol, false, rc))?;
+            return Ok(());
+        }
         client_id = auto_client_id(&auto_id_prefix);
         Some(client_id.clone())
     } else {
@@ -1965,6 +2000,30 @@ mod tests {
     }
 
     #[test]
+    fn zero_length_client_id_policy_matches_protocol_rules() {
+        assert!(zero_length_client_id_allowed(
+            ProtocolVersion::V5,
+            false,
+            true
+        ));
+        assert!(zero_length_client_id_allowed(
+            ProtocolVersion::V311,
+            true,
+            true
+        ));
+        assert!(!zero_length_client_id_allowed(
+            ProtocolVersion::V311,
+            false,
+            true
+        ));
+        assert!(!zero_length_client_id_allowed(
+            ProtocolVersion::V5,
+            true,
+            false
+        ));
+    }
+
+    #[test]
     fn auto_client_id_uses_mosquitto_uuid_shape() {
         let client_id = auto_client_id("auto-");
         assert_eq!(client_id.len(), 41);
@@ -1997,12 +2056,14 @@ mod tests {
                     allow_anonymous: true,
                     mount_point: None,
                     auto_id_prefix: None,
+                    allow_zero_length_clientid: true,
                 },
                 ListenerSettings {
                     port: 18882,
                     allow_anonymous: false,
                     mount_point: None,
                     auto_id_prefix: None,
+                    allow_zero_length_clientid: true,
                 },
             ]
         );
@@ -2027,15 +2088,29 @@ mod tests {
                     allow_anonymous: true,
                     mount_point: None,
                     auto_id_prefix: None,
+                    allow_zero_length_clientid: true,
                 },
                 ListenerSettings {
                     port: 18882,
                     allow_anonymous: true,
                     mount_point: Some("mount/".to_owned()),
                     auto_id_prefix: None,
+                    allow_zero_length_clientid: true,
                 },
             ]
         );
+
+        let _ = fs::remove_file(config);
+    }
+
+    #[test]
+    fn parse_settings_records_allow_zero_length_clientid() {
+        let config = write_temp_config("listener 18888\nallow_zero_length_clientid false\n");
+
+        let settings =
+            parse_settings(vec!["-c".to_owned(), config.clone()]).expect("settings should parse");
+
+        assert!(!settings.listeners[0].allow_zero_length_clientid);
 
         let _ = fs::remove_file(config);
     }
@@ -2103,6 +2178,7 @@ mod tests {
                 allow_anonymous: false,
                 mount_point: None,
                 auto_id_prefix: None,
+                allow_zero_length_clientid: true,
             }]
         );
 
@@ -2123,6 +2199,7 @@ mod tests {
                 allow_anonymous: false,
                 mount_point: None,
                 auto_id_prefix: None,
+                allow_zero_length_clientid: true,
             }]
         );
 
